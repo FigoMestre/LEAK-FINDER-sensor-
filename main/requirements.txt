@@ -1,0 +1,6 @@
+numpy
+scipy
+sounddevice
+opencv-python
+matplotlib
+# Acoular must be installed via pip (see README) 
