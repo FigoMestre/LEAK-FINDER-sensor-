@@ -20,7 +20,7 @@ angles = np.linspace(-np.pi/2, np.pi/2, N_ANGLES)  # -90 to +90 degrees
 mic_positions = np.zeros((N_MICS, 3))
 mic_positions[:, 0] = np.arange(N_MICS) * MIC_SPACING
 
-# --- High-pass filter ---
+# --- High-pass and Low-pass filters ---
 def butter_highpass(cutoff, fs, order=5):
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
@@ -29,6 +29,16 @@ def butter_highpass(cutoff, fs, order=5):
 
 def highpass_filter(data, cutoff, fs, order=5):
     b, a = butter_highpass(cutoff, fs, order=order)
+    return lfilter(b, a, data, axis=-1)
+
+def butter_lowpass(cutoff, fs, order=5):
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    b, a = butter(order, normal_cutoff, btype='low', analog=False)
+    return b, a
+
+def lowpass_filter(data, cutoff, fs, order=5):
+    b, a = butter_lowpass(cutoff, fs, order=order)
     return lfilter(b, a, data, axis=-1)
 
 # --- AUDIO CALLBACK ---
@@ -83,6 +93,15 @@ def main():
         print("Could not open webcam.")
         return
 
+    # Create window and trackbars for frequency selection
+    cv2.namedWindow('Acoustic Camera')
+    def nothing(x):
+        pass
+    # High-pass: 20-10000 Hz, default 1000 Hz
+    cv2.createTrackbar('High-pass (Hz)', 'Acoustic Camera', 1000, 10000, nothing)
+    # Low-pass: 1000-20000 Hz, default 8000 Hz
+    cv2.createTrackbar('Low-pass (Hz)', 'Acoustic Camera', 8000, 20000, nothing)
+
     # Start audio stream
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
@@ -95,24 +114,33 @@ def main():
 
     print("Press 'q' in the video window to quit.")
 
-    # High-pass filter parameters
-    HPF_CUTOFF = 500  # Lowered to 500 Hz for more sensitivity
-    HPF_ORDER = 4
-
     # Smoothing buffers
     smooth_intensity = 0.0
     smooth_idx = 0.0
-    alpha = 0.5  # Smoothing factor (0=slow, 1=fast)
+    alpha = 0.7  # Smoothing factor (0=slow, 1=fast, higher = faster response)
 
     while True:
         ret, frame = cap.read()
         if not ret:
             print("Failed to grab frame.")
             break
+        frame = cv2.flip(frame, 1)  # Flip horizontally to correct mirror
 
-        # Copy and high-pass filter audio buffer
+        # Get filter values from sliders
+        hp_cut = cv2.getTrackbarPos('High-pass (Hz)', 'Acoustic Camera')
+        lp_cut = cv2.getTrackbarPos('Low-pass (Hz)', 'Acoustic Camera')
+        # Ensure valid range
+        if hp_cut < 20:
+            hp_cut = 20
+        if lp_cut < 1000:
+            lp_cut = 1000
+        if lp_cut <= hp_cut:
+            lp_cut = hp_cut + 1
+
+        # Copy and filter audio buffer
         audio = audio_buffer.copy()
-        audio = highpass_filter(audio, HPF_CUTOFF, SAMPLE_RATE, HPF_ORDER)
+        audio = highpass_filter(audio, hp_cut, SAMPLE_RATE, 4)
+        audio = lowpass_filter(audio, lp_cut, SAMPLE_RATE, 4)
 
         # --- Beamforming ---
         intensities = delay_and_sum(audio, mic_positions, angles, SAMPLE_RATE, SOUND_SPEED)
@@ -123,17 +151,18 @@ def main():
         smooth_intensity = alpha * abs_max_intensity + (1 - alpha) * smooth_intensity
         smooth_idx = alpha * max_idx + (1 - alpha) * smooth_idx
 
-        abs_threshold = 0.01  # Lowered for more sensitivity
+        abs_threshold = 0.001  # Lowered for more sensitivity
         overlay = frame.copy()  # Always define overlay
-        print(f"smooth_intensity: {smooth_intensity:.4f}")  # Debug print
+        # Only show the ball if above threshold
         if smooth_intensity > abs_threshold:
             # Color: blue (low) to red (high)
             color_map = cv2.applyColorMap(np.array([int(np.clip(smooth_intensity * 255, 0, 255))], dtype=np.uint8), cv2.COLORMAP_JET)[0, 0].tolist()
             x_pos = int((smooth_idx / (len(angles) - 1)) * (frame.shape[1] - 1))
-            y_pos = frame.shape[0] // 2
-            radius = int(30 + 30 * np.clip(smooth_intensity, 0, 1))
+            # Ball moves up with intensity (bottom = low, top = high)
+            y_pos = int((1 - np.clip((smooth_intensity / 0.05), 0, 1)) * (frame.shape[0] - 1))
+            radius = int(30 + 30 * np.clip(smooth_intensity / 0.05, 0, 1))
             cv2.circle(overlay, (x_pos, y_pos), radius, color_map, -1)
-            spot_alpha = 0.5 * np.clip(smooth_intensity, 0, 1) + 0.2
+            spot_alpha = 0.5 * np.clip(smooth_intensity / 0.05, 0, 1) + 0.2
             overlay = cv2.addWeighted(overlay, spot_alpha, frame, 1 - spot_alpha, 0)
         cv2.imshow('Acoustic Camera', overlay)
         if cv2.waitKey(1) & 0xFF == ord('q'):
