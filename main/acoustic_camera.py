@@ -17,25 +17,38 @@ BLOCK_SIZE = 4096    # Audio block size (maior precisão para voz)
 N_MICS = 16          # UMA-16
 CAM_INDEX = 0        # Default webcam
 AUDIO_DEVICE = None  # Set to None for default, or use sd.query_devices() to find UMA-16 index
-MIC_SPACING = 0.01   # 1 cm spacing (meters)
+MIC_SPACING = 0.042   # 42 mm em metros
 SOUND_SPEED = 343.0  # Speed of sound in air (m/s)
 
 # Beamforming parameters
 N_ANGLES = 90  # Number of look directions (for heatmap)
 angles = np.linspace(-np.pi/2, np.pi/2, N_ANGLES)  # -90 to +90 degrees
 
-# Posições dos microfones em grid 4x4 (centralizado no zero, câmera no centro)
+# O grid 4x4 tem 4 linhas e 4 colunas, centrado em (0,0)
 N_ROWS = 4
 N_COLS = 4
 mic_positions = np.zeros((N_MICS, 3))
+
+# Calcula o deslocamento para centralizar o grid em (0,0)
+x_offset = ((N_COLS - 1) / 2) * MIC_SPACING
+y_offset = ((N_ROWS - 1) / 2) * MIC_SPACING
+
+# Ordem física dos microfones conforme fornecido
+mic_map = np.array([
+    8, 7, 10, 9,
+    6, 5, 12, 11,
+    4, 3, 14, 13,
+    2, 1, 16, 15
+]) - 1  # zero-based
+
 for idx in range(N_MICS):
     row = idx // N_COLS
     col = idx % N_COLS
-    # Centraliza o grid em (0,0)
-    x = (col - (N_COLS-1)/2) * MIC_SPACING
-    y = ((N_ROWS-1)/2 - row) * MIC_SPACING  # y decresce de cima para baixo
-    mic_positions[idx, 0] = x
-    mic_positions[idx, 1] = y
+    x = (col * MIC_SPACING) - x_offset
+    y = y_offset - (row * MIC_SPACING)
+    mic_positions[mic_map[idx], 0] = x
+    mic_positions[mic_map[idx], 1] = y
+    mic_positions[mic_map[idx], 2] = 0  # plano XY
 
 # --- High-pass and Low-pass filters ---
 def butter_highpass(cutoff, fs, order=5):
@@ -603,37 +616,51 @@ class MainWindow(QWidget):
         max_idx = np.argmax(intensities)
         self.smooth_intensity = self.alpha * abs_max_intensity + (1 - self.alpha) * self.smooth_intensity
         self.smooth_idx = self.alpha * max_idx + (1 - self.alpha) * self.smooth_idx
-        # --- Spot pelo centro de massa das intensidades dos microfones (2D) ---
+        # --- Spot híbrido: próximo = centro de massa, distante = beamforming ---
         h, w, _ = frame.shape
         mic_energies = np.sqrt(np.mean(audio**2, axis=1))
-        # Reordena as energias conforme o mapeamento físico do usuário
-        mic_map = np.array([
-            8, 7, 10, 9,
-            6, 5, 12, 11,
-            4, 3, 14, 13,
-            2, 1, 16, 15
-        ]) - 1  # zero-based
         mic_energies_ordered = mic_energies[mic_map]
-        mic_coords = np.array([(x, y) for y in range(4) for x in range(4)])
+        mic_coords = mic_positions[mic_map]  # Usa as posições reais em metros
         total_energy = np.sum(mic_energies_ordered)
         # --- Threshold adaptativo para detecção real de som ---
         if not hasattr(self, 'background_level'):
             self.background_level = 0.0
         self.background_level = 0.98 * getattr(self, 'background_level', 0.0) + 0.02 * abs_max_intensity
-        detection_threshold = self.background_level * 1.5 + 1e-6  # 50% acima do fundo
+        detection_threshold = self.background_level * 1.2 + 1e-6  # 20% acima do fundo
         detected = abs_max_intensity > detection_threshold
-        # Suavização exponencial da posição do spot
         if not hasattr(self, 'smooth_x_spot'):
-            self.smooth_x_spot = 1.5
-            self.smooth_y_spot = 1.5
-        alpha_spot = 0.7  # 0.0 = sem suavização, 1.0 = máximo suavização
+            self.smooth_x_spot = 0.0
+            self.smooth_y_spot = 0.0
+        alpha_spot = 0.4
+        # --- Spot híbrido ---
+        # Critério: se a razão entre o maior e o segundo maior mic for alta, fonte está próxima
+        sorted_energies = np.sort(mic_energies_ordered)[::-1]
+        proximity_ratio = sorted_energies[0] / (sorted_energies[1] + 1e-8)
+        proximity_threshold = 1.5  # Ajuste: quanto maior, mais exigente para considerar "próximo"
         if detected and total_energy > 0:
-            x_spot = np.sum(mic_coords[:, 0] * mic_energies_ordered) / total_energy
-            y_spot = np.sum(mic_coords[:, 1] * mic_energies_ordered) / total_energy
-            self.smooth_x_spot = alpha_spot * x_spot + (1 - alpha_spot) * self.smooth_x_spot
-            self.smooth_y_spot = alpha_spot * y_spot + (1 - alpha_spot) * self.smooth_y_spot
-            x_img = int(round(self.smooth_x_spot * (w - 1) / 3.0))
-            y_img = int(round(self.smooth_y_spot * (h - 1) / 3.0))
+            if proximity_ratio > proximity_threshold:
+                # Fonte próxima: prioriza o dominante (média ponderada exponencial)
+                power = 4
+                energies_pow = mic_energies_ordered ** power
+                total_energy_pow = np.sum(energies_pow)
+                spot_pos = np.sum(mic_coords[:, :2] * energies_pow[:, None], axis=0) / total_energy_pow
+                # Converte para coordenadas de imagem
+                x_offset = ((N_COLS - 1) / 2) * MIC_SPACING
+                y_offset = ((N_ROWS - 1) / 2) * MIC_SPACING
+                x_img = int(round((spot_pos[0] + x_offset) * (w - 1) / (MIC_SPACING * (N_COLS - 1))))
+                y_img = int(round((y_offset - spot_pos[1]) * (h - 1) / (MIC_SPACING * (N_ROWS - 1))))
+            else:
+                # Fonte distante: usa o ângulo do beamforming
+                max_idx = np.argmax(intensities)
+                theta = angles[max_idx]  # ângulo estimado da fonte (radianos)
+                # x_img: -pi/2 (esquerda) -> 0, +pi/2 (direita) -> w-1
+                x_img = int(round(((theta + np.pi/2) / np.pi) * (w - 1)))
+                y_img = h // 2
+            # Suavização exponencial
+            self.smooth_x_spot = alpha_spot * x_img + (1 - alpha_spot) * self.smooth_x_spot
+            self.smooth_y_spot = alpha_spot * y_img + (1 - alpha_spot) * self.smooth_y_spot
+            x_img = int(round(self.smooth_x_spot))
+            y_img = int(round(self.smooth_y_spot))
             # Estilização: cor e alpha baseados na intensidade
             norm_int = np.clip(self.smooth_intensity / 0.05, 0, 1)
             color_map = cv2.applyColorMap(np.array([int(np.clip(norm_int * 255, 0, 255))], dtype=np.uint8), cv2.COLORMAP_JET)[0, 0].tolist()
@@ -642,7 +669,7 @@ class MainWindow(QWidget):
             # Desenhar spot com alpha
             overlay = frame.copy()
             cv2.circle(overlay, (x_img, y_img), radius, color_map, -1)
-            cv2.circle(overlay, (x_img, y_img), radius, (0,0,0), 4)  # contorno preto
+            cv2.circle(overlay, (x_img, y_img), radius, (0,0,0), 4)
             frame = cv2.addWeighted(overlay, spot_alpha, frame, 1 - spot_alpha, 0)
             self.spot_params = (x_img, y_img, radius, tuple(color_map)+(int(255*spot_alpha),))
         else:
