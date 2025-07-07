@@ -3,12 +3,13 @@ import numpy as np
 import sounddevice as sd
 import cv2
 from scipy.signal import butter, lfilter
-from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QSlider, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, QLineEdit, QFrame, QStackedLayout, QMainWindow)
+from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QSlider, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, QLineEdit, QFrame, QStackedLayout, QMainWindow, QFileDialog, QScrollArea, QDialog)
 from PyQt5.QtCore import Qt, QTimer, QRect, QSize
 from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QColor
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import threading
+import os
 
 # --- CONFIGURATION ---
 SAMPLE_RATE = 48000  # UMA-16 default
@@ -256,6 +257,116 @@ class FullScreenCameraWidget(QWidget):
         if event:
             super().resizeEvent(event)
 
+class SavedFramesViewer(QDialog):
+    def __init__(self, frames_dir, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Frames Salvos")
+        self.setStyleSheet("background-color: #181a20; color: #fff; font-family: 'Segoe UI', Arial;")
+        self.setModal(True)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint)
+        self.setMinimumSize(500, 400)
+        self.layout = QVBoxLayout(self)
+        self.scroll = QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.inner = QWidget()
+        self.grid = QGridLayout(self.inner)
+        self.inner.setLayout(self.grid)
+        self.scroll.setWidget(self.inner)
+        self.layout.addWidget(self.scroll)
+        # Botão fechar
+        self.close_btn = QPushButton("Fechar")
+        self.close_btn.setStyleSheet("background: #23272f; color: #fff; border-radius: 8px; padding: 8px 24px; font-size: 15px; font-weight: 600;")
+        self.close_btn.clicked.connect(self.accept)
+        self.layout.addWidget(self.close_btn, alignment=Qt.AlignRight)
+        self.frames_dir = frames_dir
+        self.files = []
+        self.load_frames()
+
+    def load_frames(self):
+        # Limpa o grid
+        for i in reversed(range(self.grid.count())):
+            widget = self.grid.itemAt(i).widget()
+            if widget is not None:
+                widget.setParent(None)
+        # Lista arquivos de frame
+        self.files = [f for f in os.listdir(self.frames_dir) if f.startswith('frame_') and f.endswith('.png')]
+        self.files.sort(key=lambda x: int(x.split('_')[1].split('.')[0]))
+        row, col = 0, 0
+        for idx, fname in enumerate(self.files):
+            fpath = os.path.join(self.frames_dir, fname)
+            pixmap = QPixmap(fpath).scaled(160, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            thumb = QLabel()
+            thumb.setPixmap(pixmap)
+            thumb.setAlignment(Qt.AlignCenter)
+            thumb.setStyleSheet("background: #23272f; border-radius: 8px; margin: 8px;")
+            thumb.mousePressEvent = lambda e, i=idx: self.show_full_image(i)
+            self.grid.addWidget(thumb, row, col)
+            col += 1
+            if col >= 4:
+                col = 0
+                row += 1
+
+    def show_full_image(self, idx):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(os.path.basename(self.files[idx]))
+        dlg.setStyleSheet("background: #181a20;")
+        vbox = QVBoxLayout(dlg)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(0)
+        # Widget central para imagem e setas
+        central_widget = QWidget()
+        central_layout = QHBoxLayout(central_widget)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        # Botão esquerda
+        left_btn = QPushButton("←")
+        left_btn.setFixedSize(48, 96)
+        left_btn.setStyleSheet("background: transparent; color: #fff; border: none; font-size: 36px; font-weight: bold;")
+        left_btn.setCursor(Qt.PointingHandCursor)
+        # Imagem
+        pixmap = QPixmap(os.path.join(self.frames_dir, self.files[idx]))
+        self._img_label = QLabel()
+        self._img_label.setPixmap(pixmap.scaled(800, 600, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self._img_label.setAlignment(Qt.AlignCenter)
+        self._img_label.setStyleSheet("background: transparent; margin: 0px;")
+        # Botão direita
+        right_btn = QPushButton("→")
+        right_btn.setFixedSize(48, 96)
+        right_btn.setStyleSheet("background: transparent; color: #fff; border: none; font-size: 36px; font-weight: bold;")
+        right_btn.setCursor(Qt.PointingHandCursor)
+        # Adiciona ao layout central
+        central_layout.addWidget(left_btn, alignment=Qt.AlignVCenter)
+        central_layout.addWidget(self._img_label, stretch=1, alignment=Qt.AlignVCenter)
+        central_layout.addWidget(right_btn, alignment=Qt.AlignVCenter)
+        vbox.addWidget(central_widget, stretch=1)
+        # Botão fechar
+        close_btn = QPushButton("Fechar")
+        close_btn.setStyleSheet("background: #23272f; color: #fff; border-radius: 8px; padding: 8px 24px; font-size: 15px; font-weight: 600; margin: 16px;")
+        close_btn.clicked.connect(dlg.accept)
+        vbox.addWidget(close_btn, alignment=Qt.AlignRight)
+        dlg.setLayout(vbox)
+        dlg.resize(820, 620)
+
+        def update_image(new_idx):
+            pixmap = QPixmap(os.path.join(self.frames_dir, self.files[new_idx]))
+            self._img_label.setPixmap(pixmap.scaled(800, 600, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            dlg.setWindowTitle(os.path.basename(self.files[new_idx]))
+            dlg.repaint()
+
+        def go_left():
+            nonlocal idx
+            idx = (idx - 1) % len(self.files)
+            update_image(idx)
+
+        def go_right():
+            nonlocal idx
+            idx = (idx + 1) % len(self.files)
+            update_image(idx)
+
+        left_btn.clicked.connect(go_left)
+        right_btn.clicked.connect(go_right)
+        dlg.exec_()
+
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -307,6 +418,7 @@ class MainWindow(QWidget):
             callback=audio_callback
         )
         self.stream.start()
+        self.frames_dir = os.path.abspath('.')
 
     def init_ui(self):
         # Camera area
@@ -345,10 +457,15 @@ class MainWindow(QWidget):
         self.airleak_btn = QPushButton("Airleak Mode")
         self.airleak_btn.setStyleSheet(self.button_style())
         self.airleak_btn.clicked.connect(self.toggle_airleak_mode)
+        # --- Ver Frames Salvos Button ---
+        self.view_frames_btn = QPushButton("Ver Frames Salvos")
+        self.view_frames_btn.setStyleSheet(self.button_style())
+        self.view_frames_btn.clicked.connect(self.open_saved_frames_viewer)
         options_box = QHBoxLayout()
         options_box.addWidget(self.save_btn)
         options_box.addWidget(self.pause_btn)
         options_box.addWidget(self.airleak_btn)
+        options_box.addWidget(self.view_frames_btn)
         options_widget = QWidget()
         options_widget.setLayout(options_box)
         options_widget.setStyleSheet(self.card_style())
@@ -415,8 +532,9 @@ class MainWindow(QWidget):
             ret, frame = self.cap.read()
             if ret:
                 frame = cv2.flip(frame, 1)
-                with self.frame_lock:
-                    self.last_frame = frame.copy()
+                if not self.paused:
+                    with self.frame_lock:
+                        self.last_frame = frame.copy()
             # Pequeno sleep para não travar a CPU
             cv2.waitKey(1)
 
@@ -587,10 +705,19 @@ class MainWindow(QWidget):
         event.accept()
 
     def save_frame(self):
-        """Salva o último frame exibido como PNG."""
+        """Salva o último frame exibido como PNG, incluindo o spot do beamforming."""
         if self.last_frame is not None:
+            frame = self.last_frame.copy()
+            # Desenhar spot se existir
+            if self.spot_params is not None:
+                x_pos, y_pos, radius, spot_color = self.spot_params
+                overlay = frame.copy()
+                cv2.circle(overlay, (x_pos, y_pos), radius, spot_color[:3], -1)
+                cv2.circle(overlay, (x_pos, y_pos), radius, (0,0,0), 4)
+                alpha = spot_color[3] / 255.0
+                cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
             filename = f"frame_{self.saved_frame_count}.png"
-            cv2.imwrite(filename, self.last_frame)
+            cv2.imwrite(filename, frame)
             self.saved_frame_count += 1
     def toggle_pause(self):
         """Pausa ou retoma o vídeo da câmera."""
@@ -627,6 +754,11 @@ class MainWindow(QWidget):
             self.airleak_btn.setText("Airleak Mode")
             self.airleak_btn.setStyleSheet(self.button_style())
             self.airleak_mode = False
+
+    def open_saved_frames_viewer(self):
+        viewer = SavedFramesViewer(self.frames_dir, self)
+        viewer.resize(700, 500)
+        viewer.exec_()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
