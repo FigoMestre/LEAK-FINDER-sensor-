@@ -3,4 +3,5 @@ scipy
 sounddevice
 opencv-python
 matplotlib
+PyQt5
 # Acoular must be installed via pip (see README) 

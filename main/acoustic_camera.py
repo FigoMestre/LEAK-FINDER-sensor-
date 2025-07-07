@@ -276,6 +276,9 @@ class MainWindow(QWidget):
         self.smooth_idx = 0.0
         self.spot_params = None  # (x_pos, y_pos, radius, color_map)
         self.alpha = 0.7
+        self.airleak_mode = False
+        self.prev_hp_value = self.hp_value
+        self.prev_lp_value = self.lp_value
         self.init_ui()
         self.cap = cv2.VideoCapture(CAM_INDEX)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -332,9 +335,14 @@ class MainWindow(QWidget):
         self.pause_btn = QPushButton("Pausar Vídeo")
         self.pause_btn.setStyleSheet(self.button_style())
         self.pause_btn.clicked.connect(self.toggle_pause)
+        # --- Airleak Mode Button ---
+        self.airleak_btn = QPushButton("Airleak Mode")
+        self.airleak_btn.setStyleSheet(self.button_style())
+        self.airleak_btn.clicked.connect(self.toggle_airleak_mode)
         options_box = QHBoxLayout()
         options_box.addWidget(self.save_btn)
         options_box.addWidget(self.pause_btn)
+        options_box.addWidget(self.airleak_btn)
         options_widget = QWidget()
         options_widget.setLayout(options_box)
         options_widget.setStyleSheet(self.card_style())
@@ -573,6 +581,34 @@ class MainWindow(QWidget):
             self.pause_btn.setText("Retomar Vídeo")
         else:
             self.pause_btn.setText("Pausar Vídeo")
+
+    def toggle_airleak_mode(self):
+        """Toggle Airleak Mode: sets HP to 20kHz, LP to 40kHz, updates UI, and visually indicates mode."""
+        if not self.airleak_mode:
+            # Save previous values
+            self.prev_hp_value = self.hp_value
+            self.prev_lp_value = self.lp_value
+            # Set to airleak values
+            self.hp_value = 20000
+            self.lp_value = 40000
+            self.hp_slider.setValue(self.hp_value)
+            self.lp_slider.setValue(self.lp_value)
+            self.hp_edit.set_value(self.hp_value)
+            self.lp_edit.set_value(self.lp_value)
+            self.airleak_btn.setText("Airleak Mode ON")
+            self.airleak_btn.setStyleSheet("background: #00e676; color: #181a20; border: none; border-radius: 10px; padding: 10px 18px; font-size: 15px; font-weight: 600;")
+            self.airleak_mode = True
+        else:
+            # Restore previous values
+            self.hp_value = self.prev_hp_value
+            self.lp_value = self.prev_lp_value
+            self.hp_slider.setValue(self.hp_value)
+            self.lp_slider.setValue(self.lp_value)
+            self.hp_edit.set_value(self.hp_value)
+            self.lp_edit.set_value(self.lp_value)
+            self.airleak_btn.setText("Airleak Mode")
+            self.airleak_btn.setStyleSheet(self.button_style())
+            self.airleak_mode = False
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
