@@ -8,6 +8,7 @@ from PyQt5.QtCore import Qt, QTimer, QRect, QSize
 from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QColor
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+import threading
 
 # --- CONFIGURATION ---
 SAMPLE_RATE = 48000  # UMA-16 default
@@ -279,15 +280,20 @@ class MainWindow(QWidget):
         self.airleak_mode = False
         self.prev_hp_value = self.hp_value
         self.prev_lp_value = self.lp_value
-        self.init_ui()
+        # --- Inicializa a câmera ANTES da thread ---
         self.cap = cv2.VideoCapture(CAM_INDEX)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.frame_lock = threading.Lock()
+        self.stop_video_thread = False
+        self.video_thread = threading.Thread(target=self.video_capture_loop, daemon=True)
+        self.video_thread.start()
+        self.init_ui()
         # Timer para vídeo (máxima fluidez)
         self.video_timer = QTimer()
         self.video_timer.setTimerType(Qt.PreciseTimer)
         self.video_timer.timeout.connect(self.update_video)
-        self.video_timer.start(10)
+        self.video_timer.start(5)  # Intervalo menor para maior fluidez
         # Timer para gráficos/processamento
         self.proc_timer = QTimer()
         self.proc_timer.setTimerType(Qt.PreciseTimer)
@@ -403,19 +409,29 @@ class MainWindow(QWidget):
             self.lp_value = self.lp_slider.value()
             self.lp_edit.set_value(self.lp_value)
 
+    def video_capture_loop(self):
+        """Thread para capturar frames da câmera continuamente."""
+        while not self.stop_video_thread:
+            ret, frame = self.cap.read()
+            if ret:
+                frame = cv2.flip(frame, 1)
+                with self.frame_lock:
+                    self.last_frame = frame.copy()
+            # Pequeno sleep para não travar a CPU
+            cv2.waitKey(1)
+
     def update_video(self):
         """Atualiza apenas o vídeo da câmera, desenhando a bolinha do beamforming."""
         if self.paused:
-            if self.last_frame is not None:
-                frame = self.last_frame.copy()
-            else:
+            with self.frame_lock:
+                frame = self.last_frame.copy() if self.last_frame is not None else None
+            if frame is None:
                 return
         else:
-            ret, frame = self.cap.read()
-            if not ret:
+            with self.frame_lock:
+                frame = self.last_frame.copy() if self.last_frame is not None else None
+            if frame is None:
                 return
-            frame = cv2.flip(frame, 1)
-            self.last_frame = frame.copy()
         # Desenhar spot cinza translúcido usando overlay e contorno preto
         if self.spot_params is not None:
             x_pos, y_pos, radius, spot_color = self.spot_params
@@ -444,16 +460,15 @@ class MainWindow(QWidget):
     def update_processing(self):
         """Processamento pesado: áudio, beamforming e gráficos."""
         if self.paused:
-            if self.last_frame is not None:
-                frame = self.last_frame.copy()
-            else:
+            with self.frame_lock:
+                frame = self.last_frame.copy() if self.last_frame is not None else None
+            if frame is None:
                 return
         else:
-            ret, frame = self.cap.read()
-            if not ret:
+            with self.frame_lock:
+                frame = self.last_frame.copy() if self.last_frame is not None else None
+            if frame is None:
                 return
-            frame = cv2.flip(frame, 1)
-            self.last_frame = frame.copy()
         # Processamento de áudio
         hp_cut = self.hp_value
         lp_cut = self.lp_value
@@ -564,6 +579,9 @@ class MainWindow(QWidget):
         # O botão já é reposicionado pelo CameraWidget
 
     def closeEvent(self, event):
+        self.stop_video_thread = True
+        if self.video_thread.is_alive():
+            self.video_thread.join(timeout=1)
         self.cap.release()
         self.stream.stop()
         event.accept()
