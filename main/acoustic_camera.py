@@ -4,8 +4,8 @@ import sounddevice as sd
 import cv2
 from scipy.signal import butter, lfilter
 from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QSlider, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, QLineEdit, QFrame, QStackedLayout, QMainWindow, QFileDialog, QScrollArea, QDialog)
-from PyQt5.QtCore import Qt, QTimer, QRect, QSize, QPoint
-from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QColor, QMouseEvent, QIcon
+from PyQt5.QtCore import Qt, QTimer, QRect, QSize
+from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QColor
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import threading
@@ -381,70 +381,11 @@ class SavedFramesViewer(QDialog):
         right_btn.clicked.connect(go_right)
         dlg.exec_()
 
-class TitleBar(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.parent = parent
-        self.setFixedHeight(38)
-        self.setStyleSheet("background: #181a20; border-top-left-radius: 12px; border-top-right-radius: 12px;")
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 0, 8, 0)
-        layout.setSpacing(0)
-        self.title = QLabel(parent.windowTitle() if parent else "")
-        self.title.setStyleSheet("color: #fff; font-size: 16px; font-weight: 600;")
-        layout.addWidget(self.title, stretch=1)
-        # Minimize
-        self.min_btn = QPushButton("–")
-        self.min_btn.setFixedSize(32, 32)
-        self.min_btn.setStyleSheet("QPushButton {background: none; color: #fff; border: none; font-size: 22px; border-radius: 6px;} QPushButton:hover {background: #23272f; color: #00e676;}")
-        self.min_btn.setCursor(Qt.PointingHandCursor)
-        self.min_btn.clicked.connect(self.on_minimize)
-        layout.addWidget(self.min_btn)
-        # Maximize/Restore
-        self.max_btn = QPushButton("⬜")
-        self.max_btn.setFixedSize(32, 32)
-        self.max_btn.setStyleSheet("QPushButton {background: none; color: #fff; border: none; font-size: 18px; border-radius: 6px;} QPushButton:hover {background: #23272f; color: #00e676;}")
-        self.max_btn.setCursor(Qt.PointingHandCursor)
-        self.max_btn.clicked.connect(self.on_max_restore)
-        layout.addWidget(self.max_btn)
-        # Close
-        self.close_btn = QPushButton("✕")
-        self.close_btn.setFixedSize(32, 32)
-        self.close_btn.setStyleSheet("QPushButton {background: none; color: #fff; border: none; font-size: 18px; border-radius: 6px;} QPushButton:hover {background: #e53935; color: #fff;}")
-        self.close_btn.setCursor(Qt.PointingHandCursor)
-        self.close_btn.clicked.connect(self.on_close)
-        layout.addWidget(self.close_btn)
-        self._mouse_pos = None
-    def on_minimize(self):
-        if self.parent:
-            self.parent.showMinimized()
-    def on_max_restore(self):
-        if self.parent:
-            if self.parent.isMaximized():
-                self.parent.showNormal()
-            else:
-                self.parent.showMaximized()
-    def on_close(self):
-        if self.parent:
-            self.parent.close()
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._mouse_pos = event.globalPos() - self.parent.frameGeometry().topLeft()
-            event.accept()
-    def mouseMoveEvent(self, event):
-        if self._mouse_pos is not None and event.buttons() == Qt.LeftButton:
-            self.parent.move(event.globalPos() - self._mouse_pos)
-            event.accept()
-    def mouseReleaseEvent(self, event):
-        self._mouse_pos = None
-
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("LEAK FINDER - Acoustic Camera")
-        self.setWindowFlags(Qt.FramelessWindowHint)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setStyleSheet("background-color: #181a20; color: #fff; font-family: 'Segoe UI', Arial; border-radius: 12px;")
+        self.setStyleSheet("background-color: #181a20; color: #fff; font-family: 'Segoe UI', Arial;")
         self.setFont(QFont("Segoe UI", 11))
         self.hp_value = 80    # Filtro passa-alta padrão para voz
         self.lp_value = 3000 # Filtro passa-baixa padrão para voz
@@ -472,18 +413,7 @@ class MainWindow(QWidget):
         self.stop_video_thread = False
         self.video_thread = threading.Thread(target=self.video_capture_loop, daemon=True)
         self.video_thread.start()
-        # Layout principal com barra de título customizada
-        self.outer_layout = QVBoxLayout(self)
-        self.outer_layout.setContentsMargins(0, 0, 0, 0)
-        self.outer_layout.setSpacing(0)
-        self.title_bar = TitleBar(self)
-        self.outer_layout.addWidget(self.title_bar)
-        self.central_widget = QWidget(self)
-        self.central_layout = QVBoxLayout(self.central_widget)
-        self.central_layout.setContentsMargins(16, 16, 16, 16)
-        self.central_layout.setSpacing(0)
-        self.outer_layout.addWidget(self.central_widget, stretch=1)
-        self.init_ui(parent_layout=self.central_layout)
+        self.init_ui()
         self.cap = cv2.VideoCapture(CAM_INDEX)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -506,7 +436,7 @@ class MainWindow(QWidget):
         )
         self.stream.start()
 
-    def init_ui(self, parent_layout=None):
+    def init_ui(self):
         # Camera area
         self.camera_label = CameraWidget(self)
         self.camera_label.setMinimumSize(400, 300)
@@ -560,8 +490,9 @@ class MainWindow(QWidget):
         options_widget.setLayout(options_box)
         options_widget.setStyleSheet(self.card_style())
         # Layouts responsivos
-        main_layout = parent_layout if parent_layout is not None else QVBoxLayout(self)
-        main_layout.setSpacing(18)
+        self.main_layout = QVBoxLayout()
+        self.main_layout.setSpacing(18)
+        self.main_layout.setContentsMargins(16, 16, 16, 16)
         # Top: câmera e gráficos
         self.top_layout = QHBoxLayout()
         cam_box = QVBoxLayout()
@@ -572,19 +503,18 @@ class MainWindow(QWidget):
         graph_box.addWidget(self.intensity_canvas, stretch=1)
         graph_box.addWidget(self.heatmap_canvas, stretch=1)
         self.top_layout.addLayout(graph_box, stretch=2)
-        main_layout.addLayout(self.top_layout, stretch=4)
+        self.main_layout.addLayout(self.top_layout, stretch=4)
         # Meio: sliders
-        main_layout.addSpacing(10)
-        main_layout.addWidget(self.hp_edit)
-        main_layout.addWidget(self.hp_slider)
-        main_layout.addWidget(self.lp_edit)
-        main_layout.addWidget(self.lp_slider)
+        self.main_layout.addSpacing(10)
+        self.main_layout.addWidget(self.hp_edit)
+        self.main_layout.addWidget(self.hp_slider)
+        self.main_layout.addWidget(self.lp_edit)
+        self.main_layout.addWidget(self.lp_slider)
         # Label de coordenadas e RGB
-        main_layout.addWidget(self.coord_info_label)
+        self.main_layout.addWidget(self.coord_info_label)
         # Opções (botões)
-        main_layout.addWidget(options_widget, stretch=1)
-        if parent_layout is None:
-            self.setLayout(main_layout)
+        self.main_layout.addWidget(options_widget, stretch=1)
+        self.setLayout(self.main_layout)
 
     def slider_style(self):
         return """
