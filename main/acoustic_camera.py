@@ -406,6 +406,12 @@ class MainWindow(QWidget):
         self.prev_hp_value = self.hp_value
         self.prev_lp_value = self.lp_value
         # --- Inicializa a câmera ANTES da thread ---
+        os.environ["OPENCV_VIDEOIO_PRIORITY_GSTREAMER"] = "0"
+        import cv2
+        try:
+            cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)
+        except AttributeError:
+            pass
         self.cap = cv2.VideoCapture(CAM_INDEX)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
