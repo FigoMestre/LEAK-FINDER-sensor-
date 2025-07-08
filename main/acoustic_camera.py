@@ -4,8 +4,8 @@ import sounddevice as sd
 import cv2
 from scipy.signal import butter, lfilter
 from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QSlider, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, QLineEdit, QFrame, QStackedLayout, QMainWindow, QFileDialog, QScrollArea, QDialog)
-from PyQt5.QtCore import Qt, QTimer, QRect, QSize
-from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QColor
+from PyQt5.QtCore import Qt, QTimer, QRect, QSize, QPoint
+from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QColor, QMouseEvent, QIcon
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import threading
@@ -19,6 +19,7 @@ CAM_INDEX = 0        # Default webcam
 AUDIO_DEVICE = None  # Set to None for default, or use sd.query_devices() to find UMA-16 index
 MIC_SPACING = 0.042   # 42 mm em metros
 SOUND_SPEED = 343.0  # Speed of sound in air (m/s)
+NYQUIST = SAMPLE_RATE // 2 - 1  # 23999 Hz para 48kHz
 
 # Beamforming parameters
 N_ANGLES = 90  # Number of look directions (for heatmap)
@@ -380,11 +381,70 @@ class SavedFramesViewer(QDialog):
         right_btn.clicked.connect(go_right)
         dlg.exec_()
 
+class TitleBar(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent = parent
+        self.setFixedHeight(38)
+        self.setStyleSheet("background: #181a20; border-top-left-radius: 12px; border-top-right-radius: 12px;")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 0, 8, 0)
+        layout.setSpacing(0)
+        self.title = QLabel(parent.windowTitle() if parent else "")
+        self.title.setStyleSheet("color: #fff; font-size: 16px; font-weight: 600;")
+        layout.addWidget(self.title, stretch=1)
+        # Minimize
+        self.min_btn = QPushButton("–")
+        self.min_btn.setFixedSize(32, 32)
+        self.min_btn.setStyleSheet("QPushButton {background: none; color: #fff; border: none; font-size: 22px; border-radius: 6px;} QPushButton:hover {background: #23272f; color: #00e676;}")
+        self.min_btn.setCursor(Qt.PointingHandCursor)
+        self.min_btn.clicked.connect(self.on_minimize)
+        layout.addWidget(self.min_btn)
+        # Maximize/Restore
+        self.max_btn = QPushButton("⬜")
+        self.max_btn.setFixedSize(32, 32)
+        self.max_btn.setStyleSheet("QPushButton {background: none; color: #fff; border: none; font-size: 18px; border-radius: 6px;} QPushButton:hover {background: #23272f; color: #00e676;}")
+        self.max_btn.setCursor(Qt.PointingHandCursor)
+        self.max_btn.clicked.connect(self.on_max_restore)
+        layout.addWidget(self.max_btn)
+        # Close
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setFixedSize(32, 32)
+        self.close_btn.setStyleSheet("QPushButton {background: none; color: #fff; border: none; font-size: 18px; border-radius: 6px;} QPushButton:hover {background: #e53935; color: #fff;}")
+        self.close_btn.setCursor(Qt.PointingHandCursor)
+        self.close_btn.clicked.connect(self.on_close)
+        layout.addWidget(self.close_btn)
+        self._mouse_pos = None
+    def on_minimize(self):
+        if self.parent:
+            self.parent.showMinimized()
+    def on_max_restore(self):
+        if self.parent:
+            if self.parent.isMaximized():
+                self.parent.showNormal()
+            else:
+                self.parent.showMaximized()
+    def on_close(self):
+        if self.parent:
+            self.parent.close()
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._mouse_pos = event.globalPos() - self.parent.frameGeometry().topLeft()
+            event.accept()
+    def mouseMoveEvent(self, event):
+        if self._mouse_pos is not None and event.buttons() == Qt.LeftButton:
+            self.parent.move(event.globalPos() - self._mouse_pos)
+            event.accept()
+    def mouseReleaseEvent(self, event):
+        self._mouse_pos = None
+
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("LEAK FINDER - Acoustic Camera")
-        self.setStyleSheet("background-color: #181a20; color: #fff; font-family: 'Segoe UI', Arial;")
+        self.setWindowFlags(Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setStyleSheet("background-color: #181a20; color: #fff; font-family: 'Segoe UI', Arial; border-radius: 12px;")
         self.setFont(QFont("Segoe UI", 11))
         self.hp_value = 80    # Filtro passa-alta padrão para voz
         self.lp_value = 3000 # Filtro passa-baixa padrão para voz
@@ -412,7 +472,21 @@ class MainWindow(QWidget):
         self.stop_video_thread = False
         self.video_thread = threading.Thread(target=self.video_capture_loop, daemon=True)
         self.video_thread.start()
-        self.init_ui()
+        # Layout principal com barra de título customizada
+        self.outer_layout = QVBoxLayout(self)
+        self.outer_layout.setContentsMargins(0, 0, 0, 0)
+        self.outer_layout.setSpacing(0)
+        self.title_bar = TitleBar(self)
+        self.outer_layout.addWidget(self.title_bar)
+        self.central_widget = QWidget(self)
+        self.central_layout = QVBoxLayout(self.central_widget)
+        self.central_layout.setContentsMargins(16, 16, 16, 16)
+        self.central_layout.setSpacing(0)
+        self.outer_layout.addWidget(self.central_widget, stretch=1)
+        self.init_ui(parent_layout=self.central_layout)
+        self.cap = cv2.VideoCapture(CAM_INDEX)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         # Timer para vídeo (máxima fluidez)
         self.video_timer = QTimer()
         self.video_timer.setTimerType(Qt.PreciseTimer)
@@ -431,9 +505,8 @@ class MainWindow(QWidget):
             callback=audio_callback
         )
         self.stream.start()
-        self.frames_dir = os.path.abspath('.')
 
-    def init_ui(self):
+    def init_ui(self, parent_layout=None):
         # Camera area
         self.camera_label = CameraWidget(self)
         self.camera_label.setMinimumSize(400, 300)
@@ -462,17 +535,21 @@ class MainWindow(QWidget):
         # Opções (botões)
         self.save_btn = QPushButton("Salvar Frame")
         self.save_btn.setStyleSheet(self.button_style())
+        self.save_btn.setCursor(Qt.PointingHandCursor)
         self.save_btn.clicked.connect(self.save_frame)
         self.pause_btn = QPushButton("Pausar Vídeo")
         self.pause_btn.setStyleSheet(self.button_style())
+        self.pause_btn.setCursor(Qt.PointingHandCursor)
         self.pause_btn.clicked.connect(self.toggle_pause)
         # --- Airleak Mode Button ---
         self.airleak_btn = QPushButton("Airleak Mode")
         self.airleak_btn.setStyleSheet(self.button_style())
+        self.airleak_btn.setCursor(Qt.PointingHandCursor)
         self.airleak_btn.clicked.connect(self.toggle_airleak_mode)
         # --- Ver Frames Salvos Button ---
         self.view_frames_btn = QPushButton("Ver Frames Salvos")
         self.view_frames_btn.setStyleSheet(self.button_style())
+        self.view_frames_btn.setCursor(Qt.PointingHandCursor)
         self.view_frames_btn.clicked.connect(self.open_saved_frames_viewer)
         options_box = QHBoxLayout()
         options_box.addWidget(self.save_btn)
@@ -483,9 +560,8 @@ class MainWindow(QWidget):
         options_widget.setLayout(options_box)
         options_widget.setStyleSheet(self.card_style())
         # Layouts responsivos
-        self.main_layout = QVBoxLayout()
-        self.main_layout.setSpacing(18)
-        self.main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout = parent_layout if parent_layout is not None else QVBoxLayout(self)
+        main_layout.setSpacing(18)
         # Top: câmera e gráficos
         self.top_layout = QHBoxLayout()
         cam_box = QVBoxLayout()
@@ -496,18 +572,19 @@ class MainWindow(QWidget):
         graph_box.addWidget(self.intensity_canvas, stretch=1)
         graph_box.addWidget(self.heatmap_canvas, stretch=1)
         self.top_layout.addLayout(graph_box, stretch=2)
-        self.main_layout.addLayout(self.top_layout, stretch=4)
+        main_layout.addLayout(self.top_layout, stretch=4)
         # Meio: sliders
-        self.main_layout.addSpacing(10)
-        self.main_layout.addWidget(self.hp_edit)
-        self.main_layout.addWidget(self.hp_slider)
-        self.main_layout.addWidget(self.lp_edit)
-        self.main_layout.addWidget(self.lp_slider)
+        main_layout.addSpacing(10)
+        main_layout.addWidget(self.hp_edit)
+        main_layout.addWidget(self.hp_slider)
+        main_layout.addWidget(self.lp_edit)
+        main_layout.addWidget(self.lp_slider)
         # Label de coordenadas e RGB
-        self.main_layout.addWidget(self.coord_info_label)
+        main_layout.addWidget(self.coord_info_label)
         # Opções (botões)
-        self.main_layout.addWidget(options_widget, stretch=1)
-        self.setLayout(self.main_layout)
+        main_layout.addWidget(options_widget, stretch=1)
+        if parent_layout is None:
+            self.setLayout(main_layout)
 
     def slider_style(self):
         return """
@@ -516,7 +593,14 @@ class MainWindow(QWidget):
         QSlider::sub-page:horizontal {background: #00e676; border-radius: 4px;}
         """
     def button_style(self):
-        return "background: #23272f; color: #fff; border: none; border-radius: 10px; padding: 10px 18px; font-size: 15px; font-weight: 600;"
+        return (
+            "QPushButton {"
+            "background: #23272f; color: #fff; border: none; border-radius: 10px; padding: 10px 18px; font-size: 15px; font-weight: 600;"
+            "}"
+            "QPushButton:hover {"
+            "border: 2px solid #00e676;"
+            "}"
+        )
     def card_style(self):
         return "background: #23272f; color: #fff; border-radius: 18px; min-height: 120px; min-width: 220px; font-size: 16px; padding: 18px;"
 
@@ -603,8 +687,12 @@ class MainWindow(QWidget):
         # Processamento de áudio
         hp_cut = self.hp_value
         lp_cut = self.lp_value
-        if lp_cut <= hp_cut:
-            lp_cut = hp_cut + 1
+        # Garante diferença mínima de 10 Hz entre os filtros e nunca passa valores inválidos
+        MIN_DIFF = 10
+        lp_cut = min(lp_cut, SAMPLE_RATE / 2 - 1)
+        if lp_cut <= hp_cut + MIN_DIFF:
+            lp_cut = hp_cut + MIN_DIFF
+        hp_cut = min(hp_cut, lp_cut - MIN_DIFF, SAMPLE_RATE / 2 - 1)
         audio = audio_buffer.copy()
         audio = highpass_filter(audio, hp_cut, SAMPLE_RATE, 4)
         audio = lowpass_filter(audio, lp_cut, SAMPLE_RATE, 4)
@@ -760,7 +848,7 @@ class MainWindow(QWidget):
             # Save previous values
             self.prev_hp_value = self.hp_value
             self.prev_lp_value = self.lp_value
-            # Set to airleak values
+            # Set to airleak values (sem limitação por Nyquist)
             self.hp_value = 20000
             self.lp_value = 40000
             self.hp_slider.setValue(self.hp_value)
