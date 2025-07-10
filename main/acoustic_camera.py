@@ -10,6 +10,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import threading
 import os
+import time
 
 # --- CONFIGURATION ---
 SAMPLE_RATE = 48000  # UMA-16 default
@@ -405,6 +406,7 @@ class MainWindow(QWidget):
         self.airleak_mode = False
         self.prev_hp_value = self.hp_value
         self.prev_lp_value = self.lp_value
+        self.last_auto_save_time = 0  # Para cooldown de save automático
         # --- Inicializa a câmera ANTES da thread ---
         os.environ["OPENCV_VIDEOIO_PRIORITY_GSTREAMER"] = "0"
         import cv2
@@ -727,6 +729,13 @@ class MainWindow(QWidget):
         self.heatmap_canvas.ax.spines['left'].set_color('#fff')
         self.heatmap_canvas.draw()
         print("Energias dos mics:", mic_energies)
+
+        # --- Salvamento automático de frames no Airleak Mode ---
+        if self.airleak_mode and self.spot_params is not None:
+            now = time.time()
+            if now - self.last_auto_save_time > 10:
+                self.save_frame()
+                self.last_auto_save_time = now
 
     def toggle_camera_fullscreen(self):
         """Alterna entre modo tela cheia da câmera e modo normal."""
