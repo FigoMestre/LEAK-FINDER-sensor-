@@ -407,6 +407,7 @@ class MainWindow(QWidget):
         self.prev_hp_value = self.hp_value
         self.prev_lp_value = self.lp_value
         self.last_auto_save_time = 0  # Para cooldown de save automático
+        self.frames_dir = os.path.abspath('.')
         # --- Inicializa a câmera ANTES da thread ---
         os.environ["OPENCV_VIDEOIO_PRIORITY_GSTREAMER"] = "0"
         import cv2
