@@ -9,6 +9,10 @@ import numpy as np
 from scipy.signal import butter, sosfilt
 import cv2
 import time
+import tkinter as tk
+from tkinter import ttk, Frame, Label, Button, Entry, Scale, HORIZONTAL
+from PIL import Image, ImageTk
+import threading
 
 # --- 1. CONFIGURATION & TUNING ---
 # Audio Settings
@@ -56,6 +60,9 @@ HOTSPOT_ALPHA = 0.5            # Transparency of the hotspot circle
 latest_power_map = None
 smoothed_power_map = None
 SMOOTHING_FACTOR = 0.8  # Between 0 (no smoothing) and 1 (very smooth)
+
+# UI Theme settings
+DARK_MODE = False
 
 # --- Helper Functions ---
 def find_device_id():
@@ -124,67 +131,364 @@ def audio_callback(indata, frames, time, status):
 
     latest_power_map = smoothed_power_map
 
-# --- Main Program Execution ---
-if __name__ == "__main__":
-    device_id = find_device_id()
-    if device_id is None:
-        print(f"❌ Error: Could not find audio device matching '{DEVICE_NAME}'. Exiting.")
-        exit()
+# --- UI Class ---
+class AcousticCameraUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Acoustic Camera 2D")
+        self.root.geometry("1200x800")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        self.setup_ui()
+        self.is_running = True
+        self.stream = None
+        self.cap = None
+        self.dark_mode = False
+        self.apply_theme()
+        
+        # Initialize frequency range
+        self.min_freq_var.set(str(FREQUENCY_RANGE[0]))
+        self.max_freq_var.set(str(FREQUENCY_RANGE[1]))
+        
+        # Start camera and audio processing
+        self.start_processing()
+        
+    def setup_ui(self):
+        # Main frame
+        self.main_frame = Frame(self.root)
+        self.main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Left panel for controls
+        self.left_panel = Frame(self.main_frame, width=200)
+        self.left_panel.pack(side="left", fill="y", padx=(0, 10))
+        
+        # Left panel label
+        left_label = Label(self.left_panel, text="Intensidade e Gráficos")
+        left_label.pack(pady=(0, 10))
+        
+        # Left panel buttons
+        self.intensity_btn = Button(self.left_panel, text="Mostrar Intensidade", command=self.show_intensity)
+        self.intensity_btn.pack(fill="x", pady=5)
+        
+        self.graph_btn = Button(self.left_panel, text="Mostrar Gráfico", command=self.show_graph)
+        self.graph_btn.pack(fill="x", pady=5)
+        
+        # Center panel for camera feed
+        self.center_panel = Frame(self.main_frame)
+        self.center_panel.pack(side="left", fill="both", expand=True)
+        
+        # Camera feed label
+        self.cam_label = Label(self.center_panel, text="CAM + BEAMFORMING")
+        self.cam_label.pack(pady=(0, 10))
+        
+        # Camera canvas
+        self.canvas = tk.Canvas(self.center_panel, bg="black")
+        self.canvas.pack(fill="both", expand=True)
+        
+        # Frequency range controls
+        self.freq_frame = Frame(self.center_panel)
+        self.freq_frame.pack(fill="x", pady=10)
+        
+        freq_label = Label(self.freq_frame, text="Frequency Range:")
+        freq_label.pack(side="left", padx=(0, 10))
+        
+        # Min frequency
+        min_label = Label(self.freq_frame, text="Mínimo(High-pass):")
+        min_label.pack(side="left", padx=(0, 5))
+        
+        self.min_freq_var = tk.StringVar()
+        self.min_freq_entry = Entry(self.freq_frame, textvariable=self.min_freq_var, width=8)
+        self.min_freq_entry.pack(side="left", padx=(0, 10))
+        
+        # Max frequency
+        max_label = Label(self.freq_frame, text="Máximo(Low-pass):")
+        max_label.pack(side="left", padx=(0, 5))
+        
+        self.max_freq_var = tk.StringVar()
+        self.max_freq_entry = Entry(self.freq_frame, textvariable=self.max_freq_var, width=8)
+        self.max_freq_entry.pack(side="left")
+        
+        # Apply button
+        self.apply_btn = Button(self.freq_frame, text="Aplicar", command=self.apply_frequency)
+        self.apply_btn.pack(side="left", padx=10)
+        
+        # Frames button
+        self.frames_btn = Button(self.center_panel, text="Frames", width=20, command=self.show_frames)
+        self.frames_btn.pack(pady=10)
+        
+        # Right panel for controls
+        self.right_panel = Frame(self.main_frame, width=200)
+        self.right_panel.pack(side="right", fill="y", padx=(10, 0))
+        
+        # Right panel label
+        right_label = Label(self.right_panel, text="Funções")
+        right_label.pack(pady=(0, 10))
+        
+        # Right panel buttons
+        self.restart_btn = Button(self.right_panel, text="Reiniciar Câmera", command=self.restart_camera)
+        self.restart_btn.pack(fill="x", pady=5)
+        
+        self.save_btn = Button(self.right_panel, text="Salvar Imagem", command=self.save_image)
+        self.save_btn.pack(fill="x", pady=5)
+        
+        self.record_btn = Button(self.right_panel, text="Gravar Vídeo", command=self.toggle_recording)
+        self.record_btn.pack(fill="x", pady=5)
+        
+        self.theme_btn = Button(self.right_panel, text="Alternar Tema", command=self.toggle_theme)
+        self.theme_btn.pack(fill="x", pady=5)
+        
+        self.exit_btn = Button(self.right_panel, text="Sair", command=self.on_closing)
+        self.exit_btn.pack(fill="x", pady=5)
+        
+        # Status bar
+        self.status_bar = Label(self.root, text="Pronto", bd=1, relief="sunken", anchor="w")
+        self.status_bar.pack(side="bottom", fill="x")
+        
+        # Recording status
+        self.is_recording = False
+        self.video_writer = None
+    
+    def apply_theme(self):
+        # Define colors based on mode
+        if self.dark_mode:
+            bg_color = "#2E2E2E"
+            fg_color = "#FFFFFF"
+            button_bg = "#444444"
+            canvas_bg = "#1E1E1E"
+        else:
+            bg_color = "#F0F0F0"
+            fg_color = "#000000"
+            button_bg = "#E0E0E0"
+            canvas_bg = "#FFFFFF"
+        
+        # Apply to all widgets
+        self.root.configure(bg=bg_color)
+        self.main_frame.configure(bg=bg_color)
+        self.left_panel.configure(bg=bg_color)
+        self.center_panel.configure(bg=bg_color)
+        self.right_panel.configure(bg=bg_color)
+        self.freq_frame.configure(bg=bg_color)
+        self.canvas.configure(bg=canvas_bg)
+        self.status_bar.configure(bg=bg_color, fg=fg_color)
+        
+        # Apply to all labels
+        for widget in self.root.winfo_children():
+            self.update_widget_colors(widget, bg_color, fg_color, button_bg)
+    
+    def update_widget_colors(self, widget, bg_color, fg_color, button_bg):
+        try:
+            widget_type = widget.winfo_class()
+            
+            if widget_type in ('Label', 'Frame'):
+                # Alguns widgets como Frame não suportam a opção fg
+                if widget_type == 'Frame':
+                    widget.configure(bg=bg_color)
+                else:
+                    widget.configure(bg=bg_color, fg=fg_color)
+            elif widget_type == 'Button':
+                widget.configure(bg=button_bg, fg=fg_color, activebackground=bg_color)
+            elif widget_type == 'Entry':
+                widget.configure(bg=button_bg, fg=fg_color, insertbackground=fg_color)
+            elif widget_type == 'Canvas':
+                widget.configure(bg=bg_color)
+            
+            # Recursivamente atualiza widgets filhos
+            for child in widget.winfo_children():
+                self.update_widget_colors(child, bg_color, fg_color, button_bg)
+        except Exception as e:
+            print(f"Erro ao configurar widget {widget.winfo_class()}: {e}")
 
-    bandpass_filter = create_bandpass_filter(FREQUENCY_RANGE[0], FREQUENCY_RANGE[1], SAMPLE_RATE)
-
-    cap = cv2.VideoCapture(CAMERA_ID)
-    if not cap.isOpened():
-        print(f"❌ Error: Could not open camera with ID {CAMERA_ID}. Exiting.")
-        exit()
-
-    print("\n🚀 Starting 2D Acoustic Camera. Press 'q' to quit.")
-
-    with sd.InputStream(device=device_id, channels=CHANNELS_TO_USE, samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE, callback=audio_callback, latency='low'):
-        while True:
-            ret, frame = cap.read()
+    def toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        self.apply_theme()
+        theme_name = "Escuro" if self.dark_mode else "Claro"
+        self.status_bar.config(text=f"Tema {theme_name} aplicado")
+    
+    def start_processing(self):
+        # Initialize camera
+        self.cap = cv2.VideoCapture(CAMERA_ID)
+        if not self.cap.isOpened():
+            self.status_bar.config(text=f"Erro: Não foi possível abrir a câmera com ID {CAMERA_ID}")
+            return
+        
+        # Initialize audio
+        device_id = find_device_id()
+        if device_id is None:
+            self.status_bar.config(text=f"Erro: Não foi possível encontrar o dispositivo de áudio '{DEVICE_NAME}'")
+            return
+        
+        global bandpass_filter
+        bandpass_filter = create_bandpass_filter(FREQUENCY_RANGE[0], FREQUENCY_RANGE[1], SAMPLE_RATE)
+        
+        # Start audio stream
+        self.stream = sd.InputStream(
+            device=device_id, 
+            channels=CHANNELS_TO_USE, 
+            samplerate=SAMPLE_RATE, 
+            blocksize=BLOCK_SIZE, 
+            callback=audio_callback, 
+            latency='low'
+        )
+        self.stream.start()
+        
+        # Start video processing thread
+        self.video_thread = threading.Thread(target=self.process_video)
+        self.video_thread.daemon = True
+        self.video_thread.start()
+        
+        self.status_bar.config(text="Câmera acústica 2D iniciada. Processando...")
+    
+    def process_video(self):
+        while self.is_running and self.cap is not None:
+            ret, frame = self.cap.read()
             if not ret:
-                break
-
+                continue
+            
             frame = cv2.flip(frame, 1)
             frame_height, frame_width, _ = frame.shape
-
-            cv2.namedWindow('2D Acoustic Camera', cv2.WINDOW_NORMAL)
-            cv2.resizeWindow('2D Acoustic Camera', frame_width, frame_height)
-
-            # Create a transparent overlay layer to draw on
+            
+            # Create a transparent overlay layer
             overlay = frame.copy()
             final_frame = frame.copy()
-
+            
             if latest_power_map is not None:
-                # 1. Find the peak power and its location in the 2D map
+                # Find the peak power and its location
                 peak_v_idx, peak_h_idx = np.unravel_index(np.argmax(latest_power_map), latest_power_map.shape)
                 peak_power = latest_power_map[peak_v_idx, peak_h_idx]
-
+                
                 h_scan_range = np.arange(*H_SCAN_ANGLES)
                 v_scan_range = np.arange(*V_SCAN_ANGLES)
-
+                
                 peak_h_angle = h_scan_range[peak_h_idx]
                 peak_v_angle = v_scan_range[peak_v_idx]
-
-                # --- Draw heatmap overlay instead of hotspot ball ---
-                # Resize power_map to match frame size
-                heatmap = cv2.resize((latest_power_map * 255).astype(np.uint8), (frame_width, frame_height), interpolation=cv2.INTER_CUBIC)
+                
+                # Draw heatmap overlay
+                heatmap = cv2.resize((latest_power_map * 255).astype(np.uint8), 
+                                    (frame_width, frame_height), 
+                                    interpolation=cv2.INTER_CUBIC)
                 heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-                # Blend the heatmap with the frame
                 final_frame = cv2.addWeighted(heatmap_color, HOTSPOT_ALPHA, frame, 1 - HOTSPOT_ALPHA, 0)
-
-                # 3. Display the peak angle text regardless of power
+                
+                # Display peak angle text
                 info_text = f"PEAK H: {peak_h_angle:.1f}  V: {peak_v_angle:.1f}"
-                cv2.putText(final_frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+                cv2.putText(final_frame, info_text, (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+            
+            # Convert to RGB for tkinter
+            rgb_frame = cv2.cvtColor(final_frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(rgb_frame)
+            imgtk = ImageTk.PhotoImage(image=img)
+            
+            # Update canvas
+            self.canvas.config(width=frame_width, height=frame_height)
+            self.canvas.create_image(0, 0, anchor="nw", image=imgtk)
+            self.canvas.image = imgtk  # Keep a reference
+            
+            # Record video if enabled
+            if self.is_recording and self.video_writer is not None:
+                self.video_writer.write(final_frame)
+            
+            time.sleep(0.01)  # Small delay to reduce CPU usage
+    
+    def apply_frequency(self):
+        try:
+            min_freq = int(self.min_freq_var.get())
+            max_freq = int(self.max_freq_var.get())
+            
+            if min_freq >= max_freq:
+                self.status_bar.config(text="Erro: Frequência mínima deve ser menor que a máxima")
+                return
+            
+            global FREQUENCY_RANGE, bandpass_filter
+            FREQUENCY_RANGE = [min_freq, max_freq]
+            bandpass_filter = create_bandpass_filter(min_freq, max_freq, SAMPLE_RATE)
+            
+            self.status_bar.config(text=f"Filtro de frequência aplicado: {min_freq}Hz - {max_freq}Hz")
+        except ValueError:
+            self.status_bar.config(text="Erro: Valores de frequência inválidos")
+    
+    def show_intensity(self):
+        # Implementação para mostrar gráfico de intensidade
+        self.status_bar.config(text="Mostrando gráfico de intensidade")
+        # Aqui você pode implementar uma janela pop-up com um gráfico de intensidade
+    
+    def show_graph(self):
+        # Implementação para mostrar outros gráficos
+        self.status_bar.config(text="Mostrando gráficos")
+        # Aqui você pode implementar uma janela pop-up com gráficos adicionais
+    
+    def show_frames(self):
+        # Implementação para mostrar controles de frames
+        self.status_bar.config(text="Controles de frames ativados")
+        # Aqui você pode implementar controles adicionais para ajustar frames
+    
+    def restart_camera(self):
+        # Reiniciar a câmera
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = cv2.VideoCapture(CAMERA_ID)
+            self.status_bar.config(text="Câmera reiniciada")
+    
+    def save_image(self):
+        # Salvar a imagem atual
+        if self.cap is not None:
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            filename = f"acoustic_image_{timestamp}.png"
+            ret, frame = self.cap.read()
+            if ret:
+                cv2.imwrite(filename, frame)
+                self.status_bar.config(text=f"Imagem salva como {filename}")
+    
+    def toggle_recording(self):
+        if not self.is_recording:
+            # Start recording
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            filename = f"acoustic_video_{timestamp}.avi"
+            
+            if self.cap is not None:
+                frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fps = 20.0
+                
+                fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                self.video_writer = cv2.VideoWriter(filename, fourcc, fps, (frame_width, frame_height))
+                
+                self.is_recording = True
+                self.record_btn.config(text="Parar Gravação")
+                self.status_bar.config(text=f"Gravando vídeo para {filename}")
+        else:
+            # Stop recording
+            if self.video_writer is not None:
+                self.video_writer.release()
+                self.video_writer = None
+            
+            self.is_recording = False
+            self.record_btn.config(text="Gravar Vídeo")
+            self.status_bar.config(text="Gravação de vídeo finalizada")
+    
+    def on_closing(self):
+        self.is_running = False
+        
+        # Clean up resources
+        if self.stream is not None:
+            self.stream.stop()
+            self.stream.close()
+        
+        if self.cap is not None:
+            self.cap.release()
+        
+        if self.video_writer is not None:
+            self.video_writer.release()
+        
+        self.root.destroy()
+        print("Aplicação encerrada.")
 
-            # Show the final image
-            cv2.imshow('2D Acoustic Camera', final_frame)
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
-    # Clean up
-    cap.release()
+# --- Main Program Execution ---
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = AcousticCameraUI(root)
+    root.mainloop()
+    
+    # Clean up OpenCV windows if any are left open
     cv2.destroyAllWindows()
-    print("Application stopped.")
+    print("Aplicação encerrada.")

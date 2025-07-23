@@ -2,3 +2,5 @@ numpy
 scipy
 sounddevice
 opencv-python
+matplotlib
+Pillow
