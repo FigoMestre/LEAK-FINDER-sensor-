@@ -143,6 +143,6 @@ python mic_check.py
 
 <div align="center">
 
-**Desenvolvido com 💙 pela Equipe LEAK-FINDER**
+**Desenvolvido com 💙 pela Equipe Diogo Marques e Dinis Barros**
 
 </div>
