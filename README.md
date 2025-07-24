@@ -56,7 +56,7 @@ O LEAK-FINDER-sensor é uma câmera acústica 2D projetada para detectar e visua
 
 1. Clone o repositório:
 ```bash
-git clone https://github.com/seu-usuario/LEAK-FINDER-sensor.git
+git clone https://github.com/FigoMestre/LEAK-FINDER-sensor-.git
 cd LEAK-FINDER-sensor
 ```
 
