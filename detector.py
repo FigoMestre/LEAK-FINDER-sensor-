@@ -13,6 +13,9 @@ import tkinter as tk
 from tkinter import ttk, Frame, Label, Button, Entry, Scale, HORIZONTAL
 from PIL import Image, ImageTk
 import threading
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import glob
 
 # --- 1. CONFIGURATION & TUNING ---
 # Audio Settings
@@ -37,10 +40,10 @@ CAMERA_FOV_V = 40.0        # VERTICAL Field of View (degrees). Tune for accuracy
 # IMPORTANT: The order of mic_positions must match the channel order from the device.
 # If the beamforming is mirrored or inaccurate, try flipping the sign of x or y below.
 mic_positions = np.array([
-    [-0.066,  0.066], [-0.022,  0.066], [0.022,  0.066], [0.066,  0.066],   # Top row (MIC8, MIC7, MIC10, MIC9)
-    [-0.066,  0.022], [-0.022,  0.022], [0.022,  0.022], [0.066,  0.022],   # 2nd row (MIC6, MIC5, MIC12, MIC11)
-    [-0.066, -0.022], [-0.022, -0.022], [0.022, -0.022], [0.066, -0.022],   # 3rd row (MIC4, MIC3, MIC14, MIC13)
-    [-0.066, -0.066], [-0.022, -0.066], [0.022, -0.066], [0.066, -0.066],   # Bottom row (MIC2, MIC1, MIC16, MIC15)
+    [-0.066,  0.066], [-0.022,  0.066], [0.022,  0.066], [0.066,  0.066],   # Row 1: MIC8, MIC7, MIC10, MIC9
+    [-0.066,  0.022], [-0.022,  0.022], [0.022,  0.022], [0.066,  0.022],   # Row 2: MIC6, MIC5, MIC12, MIC11
+    [-0.066, -0.022], [-0.022, -0.022], [0.022, -0.022], [0.066, -0.022],   # Row 3: MIC4, MIC3, MIC14, MIC13
+    [-0.066, -0.066], [-0.022, -0.066], [0.022, -0.066], [0.066, -0.066],   # Row 4: MIC2, MIC1, MIC16, MIC15
 ])
 
 # --- MIRRORING OPTIONS FOR TROUBLESHOOTING ---
@@ -146,127 +149,208 @@ def audio_callback(indata, frames, time, status):
 
     latest_power_map = smoothed_power_map
 
-# --- UI Class ---
+class MicBarGraphPopup(tk.Toplevel):
+    def __init__(self, parent, get_intensities_func):
+        super().__init__(parent)
+        self.title('Microphone Intensities')
+        self.configure(bg='#23272f')
+        self.geometry('520x350')
+        self.get_intensities_func = get_intensities_func
+        self.protocol('WM_DELETE_WINDOW', self.close)
+        self.closed = False
+        self.fig, self.ax = plt.subplots(figsize=(6,3), facecolor='#23272f')
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self)
+        self.canvas.get_tk_widget().pack(fill='both', expand=True)
+        self.after(200, self.update_plot)
+    def update_plot(self):
+        if self.closed:
+            return
+        intensities = self.get_intensities_func()
+        # Normalize for better visual difference
+        if np.max(intensities) > 0:
+            norm_intensities = intensities / np.max(intensities)
+        else:
+            norm_intensities = intensities
+        self.ax.clear()
+        self.ax.bar(np.arange(1, 17), norm_intensities, color='#00e676')
+        self.ax.set_xlabel('Microphone', color='#fff')
+        self.ax.set_ylabel('Normalized Intensity', color='#fff')
+        self.ax.set_title('Microphone Intensities', color='#fff')
+        self.ax.set_facecolor('#23272f')
+        self.ax.tick_params(axis='x', colors='#fff')
+        self.ax.tick_params(axis='y', colors='#fff')
+        self.ax.spines['bottom'].set_color('#fff')
+        self.ax.spines['top'].set_color('#fff')
+        self.ax.spines['right'].set_color('#fff')
+        self.ax.spines['left'].set_color('#fff')
+        self.ax.set_ylim(0, 1.05)
+        self.canvas.draw()
+        self.after(200, self.update_plot)
+    def close(self):
+        self.closed = True
+        self.destroy()
+
+class FramesPopup(tk.Toplevel):
+    def __init__(self, parent, image_pattern='acoustic_image_*.png'):
+        super().__init__(parent)
+        self.title('Saved Frames')
+        self.configure(bg='#23272f')
+        self.geometry('800x600')
+        self.image_pattern = image_pattern
+        self.thumbnails = []
+        self.scroll_canvas = tk.Canvas(self, bg='#23272f', highlightthickness=0)
+        self.scroll_canvas.pack(side='left', fill='both', expand=True)
+        self.scrollbar = tk.Scrollbar(self, orient='vertical', command=self.scroll_canvas.yview)
+        self.scrollbar.pack(side='right', fill='y')
+        self.scroll_canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.inner_frame = tk.Frame(self.scroll_canvas, bg='#23272f')
+        self.scroll_canvas.create_window((0,0), window=self.inner_frame, anchor='nw')
+        self.inner_frame.bind('<Configure>', lambda e: self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox('all')))
+        self.load_thumbnails()
+
+    def load_thumbnails(self):
+        files = sorted(glob.glob(self.image_pattern))
+        for widget in self.inner_frame.winfo_children():
+            widget.destroy()
+        self.thumbnails = []
+        cols = 4
+        for idx, f in enumerate(files):
+            img = Image.open(f)
+            img.thumbnail((160, 120))
+            imgtk = ImageTk.PhotoImage(img)
+            lbl = tk.Label(self.inner_frame, image=imgtk, bg='#23272f', cursor='hand2')
+            lbl.image = imgtk
+            lbl.grid(row=idx//cols, column=idx%cols, padx=10, pady=10)
+            lbl.bind('<Button-1>', lambda e, path=f: self.open_full_image(path))
+            self.thumbnails.append(lbl)
+
+    def open_full_image(self, path):
+        win = tk.Toplevel(self)
+        win.title(path)
+        img = Image.open(path)
+        imgtk = ImageTk.PhotoImage(img)
+        lbl = tk.Label(win, image=imgtk)
+        lbl.image = imgtk
+        lbl.pack()
+
+class IntensityGraphPopup(tk.Toplevel):
+    def __init__(self, parent, get_rms_func):
+        super().__init__(parent)
+        self.title('Audio Intensity Over Time')
+        self.configure(bg='#23272f')
+        self.geometry('600x350')
+        self.get_rms_func = get_rms_func
+        self.protocol('WM_DELETE_WINDOW', self.close)
+        self.closed = False
+        self.fig, self.ax = plt.subplots(figsize=(7,3), facecolor='#23272f')
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self)
+        self.canvas.get_tk_widget().pack(fill='both', expand=True)
+        self.rms_history = []
+        self.max_history = 100
+        self.after(200, self.update_plot)
+    def update_plot(self):
+        if self.closed:
+            return
+        rms = self.get_rms_func()
+        self.rms_history.append(rms)
+        if len(self.rms_history) > self.max_history:
+            self.rms_history.pop(0)
+        self.ax.clear()
+        self.ax.plot(self.rms_history, color='#00e676')
+        self.ax.set_xlabel('Time (blocks)', color='#fff')
+        self.ax.set_ylabel('RMS Intensity', color='#fff')
+        self.ax.set_title('Audio Intensity Over Time', color='#fff')
+        self.ax.set_facecolor('#23272f')
+        self.ax.tick_params(axis='x', colors='#fff')
+        self.ax.tick_params(axis='y', colors='#fff')
+        self.ax.spines['bottom'].set_color('#fff')
+        self.ax.spines['top'].set_color('#fff')
+        self.ax.spines['right'].set_color('#fff')
+        self.ax.spines['left'].set_color('#fff')
+        self.ax.set_ylim(0, max(0.1, max(self.rms_history)*1.1 if self.rms_history else 0.1))
+        self.canvas.draw()
+        self.after(200, self.update_plot)
+    def close(self):
+        self.closed = True
+        self.destroy()
+
 class AcousticCameraUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Acoustic Camera 2D")
         self.root.geometry("1200x800")
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        
+        self.latest_audio_block = np.zeros((BLOCK_SIZE, CHANNELS_TO_USE))
+        self.bar_graph_popup = None
         self.setup_ui()
         self.is_running = True
         self.stream = None
         self.cap = None
         self.dark_mode = False
         self.apply_theme()
-        
-        # Initialize frequency range
         self.min_freq_var.set(str(FREQUENCY_RANGE[0]))
         self.max_freq_var.set(str(FREQUENCY_RANGE[1]))
-        
-        # Start camera and audio processing
         self.start_processing()
-        
+
     def setup_ui(self):
-        # Main frame
         self.main_frame = Frame(self.root)
         self.main_frame.pack(fill="both", expand=True, padx=10, pady=10)
-        
-        # Left panel for controls
+        # Left panel
         self.left_panel = Frame(self.main_frame, width=200)
         self.left_panel.pack(side="left", fill="y", padx=(0, 10))
-        
-        # Left panel label
         left_label = Label(self.left_panel, text="Intensidade e Gráficos")
         left_label.pack(pady=(0, 10))
-        
-        # Left panel buttons
         self.intensity_btn = Button(self.left_panel, text="Mostrar Intensidade", command=self.show_intensity)
         self.intensity_btn.pack(fill="x", pady=5)
-        
         self.graph_btn = Button(self.left_panel, text="Mostrar Gráfico", command=self.show_graph)
         self.graph_btn.pack(fill="x", pady=5)
-        
-        # Center panel for camera feed
+        # Center panel (centered camera and controls)
         self.center_panel = Frame(self.main_frame)
         self.center_panel.pack(side="left", fill="both", expand=True)
-        
-        # Camera feed label
         self.cam_label = Label(self.center_panel, text="CAM + BEAMFORMING")
         self.cam_label.pack(pady=(0, 10))
-        
-        # Camera canvas
         self.canvas = tk.Canvas(self.center_panel, bg="black")
-        self.canvas.pack(fill="both", expand=True)
-        
-        # Frequency range controls
+        self.canvas.pack(anchor='center', pady=10)
+        # Frequency controls centered below camera
         self.freq_frame = Frame(self.center_panel)
-        self.freq_frame.pack(fill="x", pady=10)
-        
+        self.freq_frame.pack(anchor='center', pady=10)
         freq_label = Label(self.freq_frame, text="Frequency Range:")
         freq_label.pack(side="left", padx=(0, 10))
-        
-        # Min frequency
         min_label = Label(self.freq_frame, text="Mínimo(High-pass):")
         min_label.pack(side="left", padx=(0, 5))
-        
         self.min_freq_var = tk.StringVar()
         self.min_freq_entry = Entry(self.freq_frame, textvariable=self.min_freq_var, width=8)
         self.min_freq_entry.pack(side="left", padx=(0, 10))
-        
-        # Max frequency
         max_label = Label(self.freq_frame, text="Máximo(Low-pass):")
         max_label.pack(side="left", padx=(0, 5))
-        
         self.max_freq_var = tk.StringVar()
         self.max_freq_entry = Entry(self.freq_frame, textvariable=self.max_freq_var, width=8)
         self.max_freq_entry.pack(side="left")
-        
-        # Apply button
         self.apply_btn = Button(self.freq_frame, text="Aplicar", command=self.apply_frequency)
         self.apply_btn.pack(side="left", padx=10)
-        
-        # Frames button
         self.frames_btn = Button(self.center_panel, text="Frames", width=20, command=self.show_frames)
         self.frames_btn.pack(pady=10)
-        
-        # Right panel for controls
+        # Right panel (remove Reiniciar Câmera)
         self.right_panel = Frame(self.main_frame, width=200)
         self.right_panel.pack(side="right", fill="y", padx=(10, 0))
-        
-        # Right panel label
         right_label = Label(self.right_panel, text="Funções")
         right_label.pack(pady=(0, 10))
-        
-        # Right panel buttons
-        self.restart_btn = Button(self.right_panel, text="Reiniciar Câmera", command=self.restart_camera)
-        self.restart_btn.pack(fill="x", pady=5)
-        
-        self.save_btn = Button(self.right_panel, text="Salvar Imagem", command=self.save_image)
+        # Only keep the other buttons
+        self.save_btn = Button(self.right_panel, text="Salvar Frame", command=self.save_image)
         self.save_btn.pack(fill="x", pady=5)
-        
         self.record_btn = Button(self.right_panel, text="Gravar Vídeo", command=self.toggle_recording)
         self.record_btn.pack(fill="x", pady=5)
-        
         self.theme_btn = Button(self.right_panel, text="Alternar Tema", command=self.toggle_theme)
         self.theme_btn.pack(fill="x", pady=5)
-        
-        # Flip X and Flip Y buttons
         self.flip_x_btn = Button(self.right_panel, text="Flip X", command=self.flip_x)
         self.flip_x_btn.pack(fill="x", pady=5)
-        
         self.exit_btn = Button(self.right_panel, text="Sair", command=self.on_closing)
         self.exit_btn.pack(fill="x", pady=5)
-        
-        # Status bar
         self.status_bar = Label(self.root, text="Pronto", bd=1, relief="sunken", anchor="w")
         self.status_bar.pack(side="bottom", fill="x")
-        
-        # Recording status
         self.is_recording = False
         self.video_writer = None
-    
+
     def apply_theme(self):
         # Define colors based on mode
         if self.dark_mode:
@@ -324,37 +408,31 @@ class AcousticCameraUI:
         self.status_bar.config(text=f"Tema {theme_name} aplicado")
     
     def start_processing(self):
-        # Initialize camera
         self.cap = cv2.VideoCapture(CAMERA_ID)
         if not self.cap.isOpened():
             self.status_bar.config(text=f"Erro: Não foi possível abrir a câmera com ID {CAMERA_ID}")
             return
-        
-        # Initialize audio
         device_id = find_device_id()
         if device_id is None:
             self.status_bar.config(text=f"Erro: Não foi possível encontrar o dispositivo de áudio '{DEVICE_NAME}'")
             return
-        
         global bandpass_filter
         bandpass_filter = create_bandpass_filter(FREQUENCY_RANGE[0], FREQUENCY_RANGE[1], SAMPLE_RATE)
-        
-        # Start audio stream
+        def audio_callback_with_block(indata, frames, time, status):
+            self.latest_audio_block = indata.copy()
+            audio_callback(indata, frames, time, status)
         self.stream = sd.InputStream(
             device=device_id, 
             channels=CHANNELS_TO_USE, 
             samplerate=SAMPLE_RATE, 
             blocksize=BLOCK_SIZE, 
-            callback=audio_callback, 
+            callback=audio_callback_with_block, 
             latency='low'
         )
         self.stream.start()
-        
-        # Start video processing thread
         self.video_thread = threading.Thread(target=self.process_video)
         self.video_thread.daemon = True
         self.video_thread.start()
-        
         self.status_bar.config(text="Câmera acústica 2D iniciada. Processando...")
     
     def process_video(self):
@@ -427,19 +505,31 @@ class AcousticCameraUI:
             self.status_bar.config(text="Erro: Valores de frequência inválidos")
     
     def show_intensity(self):
-        # Implementação para mostrar gráfico de intensidade
-        self.status_bar.config(text="Mostrando gráfico de intensidade")
-        # Aqui você pode implementar uma janela pop-up com um gráfico de intensidade
+        if not hasattr(self, 'intensity_popup') or not self.intensity_popup or not self.intensity_popup.winfo_exists():
+            self.intensity_popup = IntensityGraphPopup(self.root, self.get_latest_rms)
+            self.intensity_popup.grab_set()
+        else:
+            self.intensity_popup.lift()
+
+    def get_latest_rms(self):
+        # Return RMS of all microphones combined for the latest audio block
+        if self.latest_audio_block is not None:
+            return float(np.sqrt(np.mean(self.latest_audio_block**2)))
+        return 0.0
     
     def show_graph(self):
-        # Implementação para mostrar outros gráficos
-        self.status_bar.config(text="Mostrando gráficos")
-        # Aqui você pode implementar uma janela pop-up com gráficos adicionais
+        if self.bar_graph_popup is None or not self.bar_graph_popup.winfo_exists():
+            self.bar_graph_popup = MicBarGraphPopup(self.root, self.get_latest_mic_intensities)
+            self.bar_graph_popup.grab_set()  # Modal
+        else:
+            self.bar_graph_popup.lift()
+
+    def get_latest_mic_intensities(self):
+        # Return RMS for each channel in the latest audio block
+        return np.sqrt(np.mean(self.latest_audio_block**2, axis=0)) if self.latest_audio_block is not None else np.zeros(CHANNELS_TO_USE)
     
     def show_frames(self):
-        # Implementação para mostrar controles de frames
-        self.status_bar.config(text="Controles de frames ativados")
-        # Aqui você pode implementar controles adicionais para ajustar frames
+        FramesPopup(self.root)
     
     def restart_camera(self):
         # Reiniciar a câmera
