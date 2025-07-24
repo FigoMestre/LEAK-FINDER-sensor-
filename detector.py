@@ -37,10 +37,10 @@ CAMERA_FOV_V = 40.0        # VERTICAL Field of View (degrees). Tune for accuracy
 # IMPORTANT: The order of mic_positions must match the channel order from the device.
 # If the beamforming is mirrored or inaccurate, try flipping the sign of x or y below.
 mic_positions = np.array([
-    [-0.063,  0.075], [-0.021,  0.075], [0.021,  0.075], [0.063,  0.075],
-    [-0.063,  0.025], [-0.021,  0.025], [0.021,  0.025], [0.063,  0.025],
-    [-0.063, -0.025], [-0.021, -0.025], [0.021, -0.025], [0.063, -0.025],
-    [-0.063, -0.075], [-0.021, -0.075], [0.021, -0.075], [0.063, -0.075]
+    [-0.066,  0.066], [-0.022,  0.066], [0.022,  0.066], [0.066,  0.066],   # Top row (MIC8, MIC7, MIC10, MIC9)
+    [-0.066,  0.022], [-0.022,  0.022], [0.022,  0.022], [0.066,  0.022],   # 2nd row (MIC6, MIC5, MIC12, MIC11)
+    [-0.066, -0.022], [-0.022, -0.022], [0.022, -0.022], [0.066, -0.022],   # 3rd row (MIC4, MIC3, MIC14, MIC13)
+    [-0.066, -0.066], [-0.022, -0.066], [0.022, -0.066], [0.066, -0.066],   # Bottom row (MIC2, MIC1, MIC16, MIC15)
 ])
 
 # --- MIRRORING OPTIONS FOR TROUBLESHOOTING ---
@@ -51,8 +51,8 @@ mic_positions = np.array([
 
 # Processing & Visualization Settings
 # Coarse resolution for real-time performance. Decrease step for more precision.
-H_SCAN_ANGLES = (-70, 71, 15)  # Scan horizontally in 15-degree steps
-V_SCAN_ANGLES = (-45, 46, 15)  # Scan vertically in 15-degree steps
+H_SCAN_ANGLES = (-70, 71, 9)  # Scan horizontally in 15-degree steps
+V_SCAN_ANGLES = (-45, 46, 9)  # Scan vertically in 15-degree steps
 SPEED_OF_SOUND = 343.0         # m/s
 HOTSPOT_ALPHA = 0.5            # Transparency of the hotspot circle
 
@@ -85,32 +85,40 @@ def create_bandpass_filter(low_hz, high_hz, fs):
 
 # --- Core 2D Audio Processing Callback ---
 def audio_callback(indata, frames, time, status):
-    """This function is called by sounddevice in a separate thread."""
+    """This function is called by sounddevice in a separate thread. Now uses frequency-domain beamforming for precise frequency selectivity."""
     global latest_power_map
     if status:
         print(f"Audio Status: {status}")
 
-    filtered_audio = sosfilt(bandpass_filter, indata, axis=0)
+    # FFT parameters
+    N = indata.shape[0]  # Number of samples in this block
+    fft_data = np.fft.rfft(indata, axis=0)
+    freqs = np.fft.rfftfreq(N, d=1/SAMPLE_RATE)
+
+    # Find the closest FFT bin to the center frequency
+    center_freq = (FREQUENCY_RANGE[0] + FREQUENCY_RANGE[1]) / 2
+    freq_bin = np.argmin(np.abs(freqs - center_freq))
+
+    # Extract the FFT value at the target frequency for each channel
+    fft_at_freq = fft_data[freq_bin, :]  # shape: (CHANNELS_TO_USE,)
 
     h_angles = np.deg2rad(np.arange(*H_SCAN_ANGLES))
     v_angles = np.deg2rad(np.arange(*V_SCAN_ANGLES))
     power_map = np.zeros((len(v_angles), len(h_angles)))
+
+    wavelength = SPEED_OF_SOUND / center_freq
+    k = 2 * np.pi / wavelength  # Wavenumber
 
     # --- Nested loop for 2D scanning ---
     for v_idx, v_angle in enumerate(v_angles):
         for h_idx, h_angle in enumerate(h_angles):
             # Calculate a direction vector for the current scan angle
             dir_vector = np.array([np.cos(v_angle) * np.sin(h_angle), np.sin(v_angle)])
-
-            # Calculate time delays for each mic using dot product
-            time_delays = np.dot(mic_positions, dir_vector) / SPEED_OF_SOUND
-            sample_shifts = np.round(time_delays * SAMPLE_RATE).astype(int)
-
-            summed_signal = np.zeros(BLOCK_SIZE, dtype=np.float32)
-            for ch in range(CHANNELS_TO_USE):
-                summed_signal += np.roll(filtered_audio[:, ch], -sample_shifts[ch])
-
-            power_map[v_idx, h_idx] = np.sum(summed_signal**2)
+            # Calculate phase shifts for each mic (steering vector)
+            phase_shifts = np.exp(-1j * k * np.dot(mic_positions, dir_vector))
+            # Apply steering vector and sum across channels
+            beamformed = np.sum(fft_at_freq * phase_shifts)
+            power_map[v_idx, h_idx] = np.abs(beamformed) ** 2
 
     # Remove background offset
     power_map = power_map - np.min(power_map)
@@ -122,6 +130,13 @@ def audio_callback(indata, frames, time, status):
     # Apply a threshold to suppress noise
     threshold = 0.2  # Try values between 0.1 and 0.3
     power_map[power_map < threshold] = 0
+
+    # --- Only keep the main hotspot (global maximum) ---
+    if np.max(power_map) > 0:
+        max_idx = np.unravel_index(np.argmax(power_map), power_map.shape)
+        mask = np.zeros_like(power_map)
+        mask[max_idx] = power_map[max_idx]
+        power_map = mask
 
     global smoothed_power_map
     if smoothed_power_map is None:
@@ -236,6 +251,10 @@ class AcousticCameraUI:
         
         self.theme_btn = Button(self.right_panel, text="Alternar Tema", command=self.toggle_theme)
         self.theme_btn.pack(fill="x", pady=5)
+        
+        # Flip X and Flip Y buttons
+        self.flip_x_btn = Button(self.right_panel, text="Flip X", command=self.flip_x)
+        self.flip_x_btn.pack(fill="x", pady=5)
         
         self.exit_btn = Button(self.right_panel, text="Sair", command=self.on_closing)
         self.exit_btn.pack(fill="x", pady=5)
@@ -465,6 +484,18 @@ class AcousticCameraUI:
             self.is_recording = False
             self.record_btn.config(text="Gravar Vídeo")
             self.status_bar.config(text="Gravação de vídeo finalizada")
+    
+    def flip_x(self):
+        global mic_positions
+        mic_positions = mic_positions.copy()
+        mic_positions[:, 0] *= -1
+        print("Flipped X:", mic_positions)
+        self.status_bar.config(text="Eixo X invertido (Flip X)")
+    
+    def on_resize(self, event):
+        # Resize the canvas to fill the center panel
+        if self.center_panel.winfo_width() > 0 and self.center_panel.winfo_height() > 0:
+            self.canvas.config(width=self.center_panel.winfo_width(), height=self.center_panel.winfo_height())
     
     def on_closing(self):
         self.is_running = False
