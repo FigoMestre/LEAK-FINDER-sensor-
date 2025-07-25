@@ -2,7 +2,7 @@ import sys
 import numpy as np
 import sounddevice as sd
 import cv2
-from scipy.signal import butter, lfilter
+from scipy.signal import butter, lfilter, sosfilt, firwin
 from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QSlider, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, QLineEdit, QFrame, QStackedLayout, QMainWindow, QFileDialog, QScrollArea, QDialog)
 from PyQt5.QtCore import Qt, QTimer, QRect, QSize
 from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QColor
@@ -21,6 +21,55 @@ AUDIO_DEVICE = None  # Set to None for default, or use sd.query_devices() to fin
 MIC_SPACING = 0.042   # 42 mm em metros
 SOUND_SPEED = 343.0  # Speed of sound in air (m/s)
 NYQUIST = SAMPLE_RATE // 2 - 1  # 23999 Hz para 48kHz
+
+# --- BEAMFORMING 2D CONFIG ---
+FREQUENCY_RANGE = [800, 16000]  # Ajuste conforme interesse
+H_SCAN_ANGLES = (-70, 71, 15)   # Horizontal: de -70 a +70 em passos de 15 graus
+V_SCAN_ANGLES = (-45, 46, 15)   # Vertical: de -45 a +45 em passos de 15 graus
+SMOOTHING_FACTOR = 0.8
+
+# --- Bandpass filter (sos) ---
+def create_bandpass_filter(low_hz, high_hz, fs):
+    nyquist = 0.5 * fs
+    low = low_hz / nyquist
+    high = high_hz / nyquist
+    sos = butter(8, [low, high], btype='band', output='sos')
+    return sos
+
+# --- FIR bandpass filter (opcional para bandas estreitas) ---
+def create_fir_bandpass(low_hz, high_hz, fs, numtaps=2048):
+    nyq = 0.5 * fs
+    taps = firwin(numtaps, [low_hz/nyq, high_hz/nyq], pass_zero=False)
+    return taps
+
+# Inicialização dos filtros (serão atualizados pelos sliders)
+# bandpass_sos = create_bandpass_filter(800, 16000, SAMPLE_RATE)
+# fir_taps = create_fir_bandpass(800, 16000, SAMPLE_RATE)
+# use_fir = False  # Alternar para True para testar FIR
+
+# --- 2D Beamforming ---
+def compute_power_map(audio, mic_positions, h_scan_angles, v_scan_angles, fs, speed_of_sound):
+    h_angles = np.deg2rad(np.arange(*h_scan_angles))
+    v_angles = np.deg2rad(np.arange(*v_scan_angles))
+    power_map = np.zeros((len(v_angles), len(h_angles)))
+    for v_idx, v_angle in enumerate(v_angles):
+        for h_idx, h_angle in enumerate(h_angles):
+            dir_vector = np.array([np.cos(v_angle) * np.sin(h_angle), np.sin(v_angle)])
+            time_delays = np.dot(mic_positions, dir_vector) / speed_of_sound
+            sample_shifts = np.round(time_delays * fs).astype(int)
+            summed_signal = np.zeros(audio.shape[1], dtype=np.float32)
+            for ch in range(audio.shape[0]):
+                summed_signal += np.roll(audio[ch], -sample_shifts[ch])
+            power_map[v_idx, h_idx] = np.sum(summed_signal**2)
+    # Remove background offset
+    power_map = power_map - np.min(power_map)
+    # Normalize
+    if np.max(power_map) > 0:
+        power_map = power_map / np.max(power_map)
+    # Threshold
+    threshold = 0.2
+    power_map[power_map < threshold] = 0
+    return power_map
 
 # Beamforming parameters
 N_ANGLES = 90  # Number of look directions (for heatmap)
@@ -408,6 +457,9 @@ class MainWindow(QWidget):
         self.prev_lp_value = self.lp_value
         self.last_auto_save_time = 0  # Para cooldown de save automático
         self.frames_dir = os.path.abspath('.')
+        # --- Inicializa filtros como atributos ---
+        self.bandpass_sos = create_bandpass_filter(self.hp_value, self.lp_value, SAMPLE_RATE)
+        self.fir_taps = create_fir_bandpass(self.hp_value, self.lp_value, SAMPLE_RATE)
         # --- Inicializa a câmera ANTES da thread ---
         os.environ["OPENCV_VIDEOIO_PRIORITY_GSTREAMER"] = "0"
         import cv2
@@ -450,18 +502,19 @@ class MainWindow(QWidget):
         self.camera_label = CameraWidget(self)
         self.camera_label.setMinimumSize(400, 300)
         # High-pass
-        self.hp_edit = EditableLabel(self.hp_value, 20, 10000, "Hz", "High-pass", self.on_hp_change)
+        self.hp_edit = EditableLabel(self.hp_value, 20, 20000, "Hz", "High-pass", self.on_hp_change)
         self.hp_slider = QSlider(Qt.Horizontal)
         self.hp_slider.setMinimum(20)
-        self.hp_slider.setMaximum(10000)
+        self.hp_slider.setMaximum(20000)
         self.hp_slider.setValue(self.hp_value)
         self.hp_slider.setStyleSheet(self.slider_style())
         self.hp_slider.valueChanged.connect(self.on_hp_change)
         # Low-pass
-        self.lp_edit = EditableLabel(self.lp_value, 1000, 20000, "Hz", "Low-pass", self.on_lp_change)
+        nyq = SAMPLE_RATE // 2 - 1
+        self.lp_edit = EditableLabel(self.lp_value, 1000, nyq, "Hz", "Low-pass", self.on_lp_change)
         self.lp_slider = QSlider(Qt.Horizontal)
         self.lp_slider.setMinimum(1000)
-        self.lp_slider.setMaximum(20000)
+        self.lp_slider.setMaximum(nyq)
         self.lp_slider.setValue(self.lp_value)
         self.lp_slider.setStyleSheet(self.slider_style())
         self.lp_slider.valueChanged.connect(self.on_lp_change)
@@ -552,6 +605,24 @@ class MainWindow(QWidget):
         else:
             self.hp_value = self.hp_slider.value()
             self.hp_edit.set_value(self.hp_value)
+        # --- Limites válidos ---
+        nyq = SAMPLE_RATE // 2 - 1
+        min_diff = 10
+        if self.hp_value >= self.lp_value - min_diff:
+            self.hp_value = self.lp_value - min_diff
+            self.hp_slider.setValue(self.hp_value)
+            self.hp_edit.set_value(self.hp_value)
+        if self.hp_value < 1:
+            self.hp_value = 1
+            self.hp_slider.setValue(self.hp_value)
+            self.hp_edit.set_value(self.hp_value)
+        if self.lp_value > nyq:
+            self.lp_value = nyq
+            self.lp_slider.setValue(self.lp_value)
+            self.lp_edit.set_value(self.lp_value)
+        # Atualiza filtros ao mudar slider
+        self.bandpass_sos = create_bandpass_filter(self.hp_value, self.lp_value, SAMPLE_RATE)
+        self.fir_taps = create_fir_bandpass(self.hp_value, self.lp_value, SAMPLE_RATE)
     def on_lp_change(self, value):
         """Callback para mudança do low-pass."""
         if isinstance(value, int):
@@ -561,6 +632,24 @@ class MainWindow(QWidget):
         else:
             self.lp_value = self.lp_slider.value()
             self.lp_edit.set_value(self.lp_value)
+        # --- Limites válidos ---
+        nyq = SAMPLE_RATE // 2 - 1
+        min_diff = 10
+        if self.lp_value <= self.hp_value + min_diff:
+            self.lp_value = self.hp_value + min_diff
+            self.lp_slider.setValue(self.lp_value)
+            self.lp_edit.set_value(self.lp_value)
+        if self.lp_value > nyq:
+            self.lp_value = nyq
+            self.lp_slider.setValue(self.lp_value)
+            self.lp_edit.set_value(self.lp_value)
+        if self.hp_value < 1:
+            self.hp_value = 1
+            self.hp_slider.setValue(self.hp_value)
+            self.hp_edit.set_value(self.hp_value)
+        # Atualiza filtros ao mudar slider
+        self.bandpass_sos = create_bandpass_filter(self.hp_value, self.lp_value, SAMPLE_RATE)
+        self.fir_taps = create_fir_bandpass(self.hp_value, self.lp_value, SAMPLE_RATE)
 
     def video_capture_loop(self):
         """Thread para capturar frames da câmera continuamente."""
@@ -575,7 +664,7 @@ class MainWindow(QWidget):
             cv2.waitKey(1)
 
     def update_video(self):
-        """Atualiza apenas o vídeo da câmera, desenhando a bolinha do beamforming."""
+        """Atualiza o vídeo da câmera, desenhando o heatmap do beamforming diretamente sobre o frame."""
         if self.paused:
             with self.frame_lock:
                 frame = self.last_frame.copy() if self.last_frame is not None else None
@@ -586,15 +675,15 @@ class MainWindow(QWidget):
                 frame = self.last_frame.copy() if self.last_frame is not None else None
             if frame is None:
                 return
-        # Desenhar spot cinza translúcido usando overlay e contorno preto
-        if self.spot_params is not None:
-            x_pos, y_pos, radius, spot_color = self.spot_params
-            overlay = frame.copy()
-            cv2.circle(overlay, (x_pos, y_pos), radius, spot_color[:3], -1)
-            # Contorno preto
-            cv2.circle(overlay, (x_pos, y_pos), radius, (0,0,0), 4)
-            alpha = spot_color[3] / 255.0
-            cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+        # --- Renderizar heatmap 2D sobre o frame usando OpenCV ---
+        if hasattr(self, 'smoothed_power_map') and self.smoothed_power_map is not None:
+            power_map = self.smoothed_power_map
+            frame_height, frame_width, _ = frame.shape
+            heatmap = cv2.resize((power_map * 255).astype(np.uint8), (frame_width, frame_height), interpolation=cv2.INTER_CUBIC)
+            heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+            HOTSPOT_ALPHA = 0.5
+            frame = cv2.addWeighted(heatmap_color, HOTSPOT_ALPHA, frame, 1 - HOTSPOT_ALPHA, 0)
+        # Removido: desenho do spot/círculo
         rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_image.shape
         bytes_per_line = ch * w
@@ -623,84 +712,46 @@ class MainWindow(QWidget):
                 frame = self.last_frame.copy() if self.last_frame is not None else None
             if frame is None:
                 return
-        # Processamento de áudio
-        hp_cut = self.hp_value
-        lp_cut = self.lp_value
-        # Garante diferença mínima de 10 Hz entre os filtros e nunca passa valores inválidos
-        MIN_DIFF = 10
-        lp_cut = min(lp_cut, SAMPLE_RATE / 2 - 1)
-        if lp_cut <= hp_cut + MIN_DIFF:
-            lp_cut = hp_cut + MIN_DIFF
-        hp_cut = min(hp_cut, lp_cut - MIN_DIFF, SAMPLE_RATE / 2 - 1)
+        # --- NOVO: filtragem bandpass precisa e beamforming 2D ---
         audio = audio_buffer.copy()
-        audio = highpass_filter(audio, hp_cut, SAMPLE_RATE, 4)
-        audio = lowpass_filter(audio, lp_cut, SAMPLE_RATE, 4)
-        # Aplica janela de Hanning para reduzir vazamento espectral
+        # Escolhe filtro FIR para bandas < 200 Hz, senão IIR
+        band_width = self.lp_value - self.hp_value
+        use_fir = band_width < 200
+        if use_fir:
+            audio = lfilter(self.fir_taps, 1.0, audio, axis=-1)
+        else:
+            audio = sosfilt(self.bandpass_sos, audio, axis=-1)
         window = np.hanning(audio.shape[1])
         audio = audio * window
-        intensities = delay_and_sum(audio, mic_positions, angles, SAMPLE_RATE, SOUND_SPEED)
-        abs_max_intensity = np.max(intensities)
-        max_idx = np.argmax(intensities)
-        self.smooth_intensity = self.alpha * abs_max_intensity + (1 - self.alpha) * self.smooth_intensity
-        self.smooth_idx = self.alpha * max_idx + (1 - self.alpha) * self.smooth_idx
-        # --- Spot híbrido: próximo = centro de massa, distante = beamforming ---
-        h, w, _ = frame.shape
-        mic_energies = np.sqrt(np.mean(audio**2, axis=1))
-        mic_energies_ordered = mic_energies[mic_map]
-        mic_coords = mic_positions[mic_map]  # Usa as posições reais em metros
-        total_energy = np.sum(mic_energies_ordered)
-        # --- Threshold adaptativo para detecção real de som ---
-        if not hasattr(self, 'background_level'):
-            self.background_level = 0.0
-        self.background_level = 0.98 * getattr(self, 'background_level', 0.0) + 0.02 * abs_max_intensity
-        detection_threshold = self.background_level * 1.2 + 1e-6  # 20% acima do fundo
-        detected = abs_max_intensity > detection_threshold
-        if not hasattr(self, 'smooth_x_spot'):
-            self.smooth_x_spot = 0.0
-            self.smooth_y_spot = 0.0
-        alpha_spot = 0.4
-        # --- Spot híbrido ---
-        # Critério: se a razão entre o maior e o segundo maior mic for alta, fonte está próxima
-        sorted_energies = np.sort(mic_energies_ordered)[::-1]
-        proximity_ratio = sorted_energies[0] / (sorted_energies[1] + 1e-8)
-        proximity_threshold = 1.5  # Ajuste: quanto maior, mais exigente para considerar "próximo"
-        if detected and total_energy > 0:
-            if proximity_ratio > proximity_threshold:
-                # Fonte próxima: prioriza o dominante (média ponderada exponencial)
-                power = 4
-                energies_pow = mic_energies_ordered ** power
-                total_energy_pow = np.sum(energies_pow)
-                spot_pos = np.sum(mic_coords[:, :2] * energies_pow[:, None], axis=0) / total_energy_pow
-                # Converte para coordenadas de imagem
-                x_offset = ((N_COLS - 1) / 2) * MIC_SPACING
-                y_offset = ((N_ROWS - 1) / 2) * MIC_SPACING
-                x_img = int(round((spot_pos[0] + x_offset) * (w - 1) / (MIC_SPACING * (N_COLS - 1))))
-                y_img = int(round((y_offset - spot_pos[1]) * (h - 1) / (MIC_SPACING * (N_ROWS - 1))))
-            else:
-                # Fonte distante: usa o ângulo do beamforming
-                max_idx = np.argmax(intensities)
-                theta = angles[max_idx]  # ângulo estimado da fonte (radianos)
-                # x_img: -pi/2 (esquerda) -> 0, +pi/2 (direita) -> w-1
-                x_img = int(round(((theta + np.pi/2) / np.pi) * (w - 1)))
-                y_img = h // 2
-            # Suavização exponencial
-            self.smooth_x_spot = alpha_spot * x_img + (1 - alpha_spot) * self.smooth_x_spot
-            self.smooth_y_spot = alpha_spot * y_img + (1 - alpha_spot) * self.smooth_y_spot
-            x_img = int(round(self.smooth_x_spot))
-            y_img = int(round(self.smooth_y_spot))
-            # Estilização: cor e alpha baseados na intensidade
-            norm_int = np.clip(self.smooth_intensity / 0.05, 0, 1)
-            color_map = cv2.applyColorMap(np.array([int(np.clip(norm_int * 255, 0, 255))], dtype=np.uint8), cv2.COLORMAP_JET)[0, 0].tolist()
-            radius = int(30 + 30 * norm_int)
-            spot_alpha = 0.5 * norm_int + 0.2
-            # Desenhar spot com alpha
-            overlay = frame.copy()
-            cv2.circle(overlay, (x_img, y_img), radius, color_map, -1)
-            cv2.circle(overlay, (x_img, y_img), radius, (0,0,0), 4)
-            frame = cv2.addWeighted(overlay, spot_alpha, frame, 1 - spot_alpha, 0)
-            self.spot_params = (x_img, y_img, radius, tuple(color_map)+(int(255*spot_alpha),))
+        mic_pos_2d = mic_positions[:, :2] if mic_positions.shape[1] > 2 else mic_positions
+        power_map = compute_power_map(audio, mic_pos_2d, H_SCAN_ANGLES, V_SCAN_ANGLES, SAMPLE_RATE, SOUND_SPEED)
+        if not hasattr(self, 'smoothed_power_map') or self.smoothed_power_map is None:
+            self.smoothed_power_map = power_map
         else:
-            self.spot_params = None
+            self.smoothed_power_map = SMOOTHING_FACTOR * self.smoothed_power_map + (1 - SMOOTHING_FACTOR) * power_map
+        # --- Gráfico FFT do áudio filtrado (substitui heatmap) ---
+        self.heatmap_canvas.ax.clear()
+        audio_mean = np.mean(audio, axis=0)
+        N = len(audio_mean)
+        freqs = np.fft.rfftfreq(N, d=1/SAMPLE_RATE)
+        fft_vals = np.abs(np.fft.rfft(audio_mean))
+        self.heatmap_canvas.ax.plot(freqs, fft_vals, color="#00e676", linewidth=2)
+        # Destaca a banda filtrada
+        self.heatmap_canvas.ax.axvspan(self.hp_value, self.lp_value, color='red', alpha=0.2, label='Banda filtrada')
+        self.heatmap_canvas.ax.set_xlim(0, 40000)
+        self.heatmap_canvas.ax.set_xlabel("Frequência (Hz)", color="#fff")
+        self.heatmap_canvas.ax.set_ylabel("Magnitude", color="#fff")
+        self.heatmap_canvas.ax.set_title("Espectro FFT do Áudio Filtrado", color="#fff", fontsize=12, pad=24, loc='center')
+        self.heatmap_canvas.ax.set_facecolor("none")
+        self.heatmap_canvas.ax.tick_params(axis='x', colors='#fff')
+        self.heatmap_canvas.ax.tick_params(axis='y', colors='#fff')
+        self.heatmap_canvas.ax.spines['bottom'].set_color('#fff')
+        self.heatmap_canvas.ax.spines['top'].set_color('#fff')
+        self.heatmap_canvas.ax.spines['right'].set_color('#fff')
+        self.heatmap_canvas.ax.spines['left'].set_color('#fff')
+        self.heatmap_canvas.ax.legend(loc='upper right', facecolor='#23272f', edgecolor='#fff', labelcolor='#fff')
+        self.heatmap_canvas.draw()
+        # Removido: cálculo e atualização do spot/círculo
         # Atualiza gráfico de intensidade
         self.intensity_history.append(self.smooth_intensity)
         if len(self.intensity_history) > 100:
@@ -717,19 +768,6 @@ class MainWindow(QWidget):
         self.intensity_canvas.ax.spines['left'].set_color('#fff')
         self.intensity_canvas.ax.set_ylim(0, max(0.05, max(self.intensity_history)))
         self.intensity_canvas.draw()
-        # Atualiza heatmap
-        self.heatmap_canvas.ax.clear()
-        self.heatmap_canvas.ax.imshow([intensities], aspect='auto', cmap='jet', extent=[-90, 90, 0, 1])
-        self.heatmap_canvas.ax.set_facecolor("none")
-        self.heatmap_canvas.ax.set_title("Heatmap Beamforming", color="#fff", fontsize=12, pad=24, loc='center')
-        self.heatmap_canvas.ax.get_yaxis().set_visible(False)
-        self.heatmap_canvas.ax.tick_params(axis='x', colors='#fff')
-        self.heatmap_canvas.ax.spines['bottom'].set_color('#fff')
-        self.heatmap_canvas.ax.spines['top'].set_color('#fff')
-        self.heatmap_canvas.ax.spines['right'].set_color('#fff')
-        self.heatmap_canvas.ax.spines['left'].set_color('#fff')
-        self.heatmap_canvas.draw()
-        print("Energias dos mics:", mic_energies)
 
         # --- Salvamento automático de frames no Airleak Mode ---
         if self.airleak_mode and self.spot_params is not None:
@@ -789,18 +827,22 @@ class MainWindow(QWidget):
             self.pause_btn.setText("Pausar Vídeo")
 
     def toggle_airleak_mode(self):
-        """Toggle Airleak Mode: sets HP to 20kHz, LP to 40kHz, updates UI, and visually indicates mode."""
+        """Toggle Airleak Mode: sets HP to 20kHz, LP to máximo permitido (Nyquist-1), atualiza UI e filtros."""
+        nyq = SAMPLE_RATE // 2 - 1
         if not self.airleak_mode:
             # Save previous values
             self.prev_hp_value = self.hp_value
             self.prev_lp_value = self.lp_value
-            # Set to airleak values (sem limitação por Nyquist)
+            # Set to airleak values (respeitando Nyquist)
             self.hp_value = 20000
-            self.lp_value = 40000
+            self.lp_value = min(40000, nyq)
             self.hp_slider.setValue(self.hp_value)
             self.lp_slider.setValue(self.lp_value)
             self.hp_edit.set_value(self.hp_value)
             self.lp_edit.set_value(self.lp_value)
+            # Atualiza filtros ao mudar para airleak
+            self.bandpass_sos = create_bandpass_filter(self.hp_value, self.lp_value, SAMPLE_RATE)
+            self.fir_taps = create_fir_bandpass(self.hp_value, self.lp_value, SAMPLE_RATE)
             self.airleak_btn.setText("Airleak Mode ON")
             self.airleak_btn.setStyleSheet("background: #00e676; color: #181a20; border: none; border-radius: 10px; padding: 10px 18px; font-size: 15px; font-weight: 600;")
             self.airleak_mode = True
@@ -812,6 +854,9 @@ class MainWindow(QWidget):
             self.lp_slider.setValue(self.lp_value)
             self.hp_edit.set_value(self.hp_value)
             self.lp_edit.set_value(self.lp_value)
+            # Atualiza filtros ao restaurar
+            self.bandpass_sos = create_bandpass_filter(self.hp_value, self.lp_value, SAMPLE_RATE)
+            self.fir_taps = create_fir_bandpass(self.hp_value, self.lp_value, SAMPLE_RATE)
             self.airleak_btn.setText("Airleak Mode")
             self.airleak_btn.setStyleSheet(self.button_style())
             self.airleak_mode = False
