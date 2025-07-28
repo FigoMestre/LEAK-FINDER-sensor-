@@ -12,6 +12,27 @@ import threading
 import os
 import time
 
+# --- NOVA FUNÇÃO: gerar gradiente circular colorido (heatmap tipo JET) ---
+def generate_heatmap_spot(radius, intensity=1.0):
+    """
+    Gera uma imagem RGBA (2*radius x 2*radius) com gradiente circular colorido (colormap JET).
+    O centro é mais opaco e as bordas mais transparentes.
+    """
+    size = 2 * radius
+    y, x = np.ogrid[-radius:radius, -radius:radius]
+    dist = np.sqrt(x**2 + y**2)
+    norm = np.clip(1 - dist / radius, 0, 1)  # 1 no centro, 0 na borda
+    # Suaviza o gradiente (gaussiano)
+    norm = norm ** 2
+    # Aplica intensidade
+    norm = norm * intensity
+    # Colormap JET
+    colormap = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    # Alpha: centro opaco, borda transparente
+    alpha = (norm * 255).astype(np.uint8)
+    heatmap_rgba = np.dstack([colormap, alpha])  # shape (size, size, 4)
+    return heatmap_rgba
+
 # --- CONFIGURATION ---
 SAMPLE_RATE = 48000  # UMA-16 default
 BLOCK_SIZE = 4096    # Audio block size (maior precisão para voz)
@@ -33,13 +54,45 @@ def create_bandpass_filter(low_hz, high_hz, fs):
     nyquist = 0.5 * fs
     low = low_hz / nyquist
     high = high_hz / nyquist
-    sos = butter(8, [low, high], btype='band', output='sos')
+    # Aumenta a ordem do filtro para maior seletividade
+    sos = butter(12, [low, high], btype='band', output='sos')
     return sos
 
 # --- FIR bandpass filter (opcional para bandas estreitas) ---
 def create_fir_bandpass(low_hz, high_hz, fs, numtaps=2048):
     nyq = 0.5 * fs
     taps = firwin(numtaps, [low_hz/nyq, high_hz/nyq], pass_zero=False)
+    return taps
+
+# --- Filtro FIR mais robusto para rejeição adequada ---
+def create_robust_fir_bandpass(low_hz, high_hz, fs, numtaps=4096):
+    """
+    Cria um filtro FIR mais robusto com maior rejeição fora da banda.
+    Usa numtaps alto para melhor seletividade.
+    """
+    nyq = 0.5 * fs
+    # Banda de transição mais suave para não atenuar demais o sinal dentro da banda
+    transition_width = min(50, (high_hz - low_hz) * 0.05)  # 5% da banda ou 50 Hz
+    # Garante que as frequências de corte são válidas
+    low_cut = max(1, low_hz - transition_width)  # Mínimo 1 Hz
+    high_cut = min(nyq - 1, high_hz + transition_width)  # Máximo Nyquist - 1
+    taps = firwin(numtaps, [low_cut/nyq, high_cut/nyq], pass_zero=False, window='hamming')
+    return taps
+
+# --- Filtro notch para rejeitar frequências específicas ---
+def create_notch_filter(freq_hz, fs, numtaps=1024, q_factor=10):
+    """
+    Cria um filtro notch para rejeitar uma frequência específica.
+    """
+    nyq = 0.5 * fs
+    # Banda de rejeição
+    bw = freq_hz / q_factor
+    low_cut = (freq_hz - bw/2) / nyq
+    high_cut = (freq_hz + bw/2) / nyq
+    # Garante número ímpar de taps para evitar erro na frequência de Nyquist
+    if numtaps % 2 == 0:
+        numtaps += 1
+    taps = firwin(numtaps, [low_cut, high_cut], pass_zero=True, window='hamming')
     return taps
 
 # Inicialização dos filtros (serão atualizados pelos sliders)
@@ -70,6 +123,68 @@ def compute_power_map(audio, mic_positions, h_scan_angles, v_scan_angles, fs, sp
     threshold = 0.2
     power_map[power_map < threshold] = 0
     return power_map
+
+# --- BEAMFORMING ADAPTATIVO BASEADO EM ENERGIA POR MICROFONE ---
+def get_neighbor_mics(mic_idx, mic_positions):
+    """Retorna os microfones vizinhos de um microfone específico."""
+    # Para array 4x4, os vizinhos são os microfones adjacentes
+    neighbors = []
+    row = mic_idx // 4
+    col = mic_idx % 4
+    
+    # Vizinhos nas 8 direções
+    for dr in [-1, 0, 1]:
+        for dc in [-1, 0, 1]:
+            if dr == 0 and dc == 0:
+                continue  # Pula o próprio microfone
+            new_row = row + dr
+            new_col = col + dc
+            if 0 <= new_row < 4 and 0 <= new_col < 4:
+                neighbor_idx = new_row * 4 + new_col
+                neighbors.append(neighbor_idx)
+    return neighbors
+
+def adaptive_beamforming(audio, mic_positions, mic_map):
+    """
+    Beamforming adaptativo baseado na análise de energia por microfone.
+    Retorna posição estimada da fonte e intensidade.
+    """
+    # Calcula energia de cada microfone
+    mic_energies = np.sqrt(np.mean(audio**2, axis=1))
+    
+    # Ordena microfones por energia (mais forte primeiro)
+    sorted_mics = np.argsort(mic_energies)[::-1]
+    
+    # Identifica microfones ativos (energia acima do threshold)
+    energy_threshold = np.max(mic_energies) * 0.3  # 30% do máximo
+    active_mics = [m for m in sorted_mics if mic_energies[m] > energy_threshold]
+    
+    if len(active_mics) < 2:
+        # Se só um microfone ativo, usa beamforming tradicional
+        return None, np.max(mic_energies)
+    
+    # Pega os 2 microfones mais ativos
+    primary_mic = active_mics[0]
+    secondary_mic = active_mics[1]
+    
+    # Calcula posições dos microfones ativos
+    primary_pos = mic_positions[mic_map[primary_mic]]
+    secondary_pos = mic_positions[mic_map[secondary_mic]]
+    
+    # Calcula centro de massa ponderado
+    total_energy = mic_energies[primary_mic] + mic_energies[secondary_mic]
+    weighted_pos = (primary_pos * mic_energies[primary_mic] + 
+                   secondary_pos * mic_energies[secondary_mic]) / total_energy
+    
+    # Converte para coordenadas de imagem
+    h, w = 480, 640  # Ajuste conforme necessário
+    x_offset = ((N_COLS - 1) / 2) * MIC_SPACING
+    y_offset = ((N_ROWS - 1) / 2) * MIC_SPACING
+    
+    x_img = int(round((weighted_pos[0] + x_offset) * (w - 1) / (MIC_SPACING * (N_COLS - 1))))
+    y_img = int(round((y_offset - weighted_pos[1]) * (h - 1) / (MIC_SPACING * (N_ROWS - 1))))
+    
+    return (x_img, y_img), np.max(mic_energies)
 
 # Beamforming parameters
 N_ANGLES = 90  # Number of look directions (for heatmap)
@@ -487,7 +602,7 @@ class MainWindow(QWidget):
         self.proc_timer = QTimer()
         self.proc_timer.setTimerType(Qt.PreciseTimer)
         self.proc_timer.timeout.connect(self.update_processing)
-        self.proc_timer.start(200)
+        self.proc_timer.start(400)  # Intervalo maior para aliviar processamento pesado
         self.stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
             blocksize=BLOCK_SIZE,
@@ -664,7 +779,7 @@ class MainWindow(QWidget):
             cv2.waitKey(1)
 
     def update_video(self):
-        """Atualiza o vídeo da câmera, desenhando o heatmap do beamforming diretamente sobre o frame."""
+        """Atualiza o vídeo da câmera, desenhando o spot com heatmap interno."""
         if self.paused:
             with self.frame_lock:
                 frame = self.last_frame.copy() if self.last_frame is not None else None
@@ -675,15 +790,30 @@ class MainWindow(QWidget):
                 frame = self.last_frame.copy() if self.last_frame is not None else None
             if frame is None:
                 return
-        # --- Renderizar heatmap 2D sobre o frame usando OpenCV ---
-        if hasattr(self, 'smoothed_power_map') and self.smoothed_power_map is not None:
-            power_map = self.smoothed_power_map
-            frame_height, frame_width, _ = frame.shape
-            heatmap = cv2.resize((power_map * 255).astype(np.uint8), (frame_width, frame_height), interpolation=cv2.INTER_CUBIC)
-            heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-            HOTSPOT_ALPHA = 0.5
-            frame = cv2.addWeighted(heatmap_color, HOTSPOT_ALPHA, frame, 1 - HOTSPOT_ALPHA, 0)
-        # Removido: desenho do spot/círculo
+        # --- Desenhar spot com heatmap interno ---
+        if self.spot_params is not None:
+            x_pos, y_pos, radius, spot_color = self.spot_params
+            # Gera heatmap spot (gradiente circular colorido)
+            heatmap = generate_heatmap_spot(radius, intensity=1.0)
+            h_spot, w_spot, _ = heatmap.shape
+            x0 = x_pos - w_spot // 2
+            y0 = y_pos - h_spot // 2
+            # Limita para não sair da imagem
+            x1 = max(x0, 0)
+            y1 = max(y0, 0)
+            x2 = min(x0 + w_spot, frame.shape[1])
+            y2 = min(y0 + h_spot, frame.shape[0])
+            hx1 = x1 - x0
+            hy1 = y1 - y0
+            hx2 = hx1 + (x2 - x1)
+            hy2 = hy1 + (y2 - y1)
+            # Overlay RGBA
+            overlay = frame[y1:y2, x1:x2].copy()
+            spot_rgba = heatmap[hy1:hy2, hx1:hx2]
+            alpha = spot_rgba[..., 3:4] / 255.0
+            overlay = (overlay * (1 - alpha) + spot_rgba[..., :3] * alpha).astype(np.uint8)
+            frame[y1:y2, x1:x2] = overlay
+        # Apenas atualização visual, sem processamento pesado
         rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_image.shape
         bytes_per_line = ch * w
@@ -714,21 +844,83 @@ class MainWindow(QWidget):
                 return
         # --- NOVO: filtragem bandpass precisa e beamforming 2D ---
         audio = audio_buffer.copy()
-        # Escolhe filtro FIR para bandas < 200 Hz, senão IIR
+        # --- FILTRAGEM ROBUSTA ---
         band_width = self.lp_value - self.hp_value
-        use_fir = band_width < 200
-        if use_fir:
-            audio = lfilter(self.fir_taps, 1.0, audio, axis=-1)
+        if band_width > 1000:
+            robust_taps = create_robust_fir_bandpass(self.hp_value, self.lp_value, SAMPLE_RATE)
+            audio = lfilter(robust_taps, 1.0, audio, axis=-1)
+            use_fir = True
         else:
-            audio = sosfilt(self.bandpass_sos, audio, axis=-1)
+            audio = lfilter(self.fir_taps, 1.0, audio, axis=-1)
+            use_fir = True
+        if self.hp_value < 5000 < self.lp_value:
+            pass
+        else:
+            notch_taps = create_notch_filter(5000, SAMPLE_RATE)
+            audio = lfilter(notch_taps, 1.0, audio, axis=-1)
         window = np.hanning(audio.shape[1])
         audio = audio * window
-        mic_pos_2d = mic_positions[:, :2] if mic_positions.shape[1] > 2 else mic_positions
-        power_map = compute_power_map(audio, mic_pos_2d, H_SCAN_ANGLES, V_SCAN_ANGLES, SAMPLE_RATE, SOUND_SPEED)
-        if not hasattr(self, 'smoothed_power_map') or self.smoothed_power_map is None:
-            self.smoothed_power_map = power_map
+        # --- VOLTA AO BEAMFORMING 1D ORIGINAL (SPOT HÍBRIDO) ---
+        intensities = delay_and_sum(audio, mic_positions, angles, SAMPLE_RATE, SOUND_SPEED)
+        abs_max_intensity = np.max(intensities)
+        max_idx = np.argmax(intensities)
+        # --- Interpolação parabólica para refinar o ângulo máximo ---
+        if 1 <= max_idx < len(intensities) - 1:
+            y0, y1, y2 = intensities[max_idx-1:max_idx+2]
+            denom = (y0 - 2*y1 + y2)
+            if denom != 0:
+                delta = 0.5 * (y0 - y2) / denom
+                refined_angle = angles[max_idx] + delta * (angles[1] - angles[0])
+            else:
+                refined_angle = angles[max_idx]
         else:
-            self.smoothed_power_map = SMOOTHING_FACTOR * self.smoothed_power_map + (1 - SMOOTHING_FACTOR) * power_map
+            refined_angle = angles[max_idx]
+        self.smooth_intensity = self.alpha * np.sqrt(np.mean(audio**2)) + (1 - self.alpha) * self.smooth_intensity
+        self.smooth_idx = self.alpha * max_idx + (1 - self.alpha) * self.smooth_idx
+        # --- Spot híbrido: próximo = centro de massa, distante = beamforming ---
+        h, w, _ = frame.shape
+        mic_energies = np.sqrt(np.mean(audio**2, axis=1))
+        mic_energies_ordered = mic_energies[mic_map]
+        mic_coords = mic_positions[mic_map]
+        total_energy = np.sum(mic_energies_ordered)
+        if not hasattr(self, 'background_level'):
+            self.background_level = 0.0
+        self.background_level = 0.95 * getattr(self, 'background_level', 0.0) + 0.05 * abs_max_intensity
+        detection_threshold = self.background_level * 1.1 + 1e-6
+        detected = abs_max_intensity > detection_threshold
+        if not hasattr(self, 'smooth_x_spot'):
+            self.smooth_x_spot = 0.0
+            self.smooth_y_spot = 0.0
+        alpha_spot = 0.4
+        # Critério: se a razão entre o maior e o segundo maior mic for alta, fonte está próxima
+        sorted_energies = np.sort(mic_energies_ordered)[::-1]
+        proximity_ratio = sorted_energies[0] / (sorted_energies[1] + 1e-8)
+        proximity_threshold = 1.5
+        if detected and total_energy > 0:
+            if proximity_ratio > proximity_threshold:
+                power = 4
+                energies_pow = mic_energies_ordered ** power
+                total_energy_pow = np.sum(energies_pow)
+                spot_pos = np.sum(mic_coords[:, :2] * energies_pow[:, None], axis=0) / total_energy_pow
+                x_offset = ((N_COLS - 1) / 2) * MIC_SPACING
+                y_offset = ((N_ROWS - 1) / 2) * MIC_SPACING
+                x_img = int(round((spot_pos[0] + x_offset) * (w - 1) / (MIC_SPACING * (N_COLS - 1))))
+                y_img = int(round((y_offset - spot_pos[1]) * (h - 1) / (MIC_SPACING * (N_ROWS - 1))))
+            else:
+                theta = refined_angle
+                x_img = int(round(((theta + np.pi/2) / np.pi) * (w - 1)))
+                y_img = h // 2
+            self.smooth_x_spot = alpha_spot * x_img + (1 - alpha_spot) * self.smooth_x_spot
+            self.smooth_y_spot = alpha_spot * y_img + (1 - alpha_spot) * self.smooth_y_spot
+            x_img = int(round(self.smooth_x_spot))
+            y_img = int(round(self.smooth_y_spot))
+            norm_int = np.clip(self.smooth_intensity / 0.05, 0, 1)
+            color_map = cv2.applyColorMap(np.array([int(np.clip(norm_int * 255, 0, 255))], dtype=np.uint8), cv2.COLORMAP_JET)[0, 0].tolist()
+            radius = int(60 + 40 * norm_int)
+            spot_alpha = 0.5 * norm_int + 0.2
+            self.spot_params = (x_img, y_img, radius, tuple(color_map)+(int(255*spot_alpha),))
+        else:
+            self.spot_params = None
         # --- Gráfico FFT do áudio filtrado (substitui heatmap) ---
         self.heatmap_canvas.ax.clear()
         audio_mean = np.mean(audio, axis=0)
@@ -738,6 +930,14 @@ class MainWindow(QWidget):
         self.heatmap_canvas.ax.plot(freqs, fft_vals, color="#00e676", linewidth=2)
         # Destaca a banda filtrada
         self.heatmap_canvas.ax.axvspan(self.hp_value, self.lp_value, color='red', alpha=0.2, label='Banda filtrada')
+        # Adiciona linhas verticais para mostrar os limites do filtro
+        self.heatmap_canvas.ax.axvline(x=self.hp_value, color='yellow', linestyle='--', alpha=0.7, label=f'HP: {self.hp_value} Hz')
+        self.heatmap_canvas.ax.axvline(x=self.lp_value, color='yellow', linestyle='--', alpha=0.7, label=f'LP: {self.lp_value} Hz')
+        # Mostra informação sobre o tipo de filtro usado
+        filter_type = "FIR Robusto" if band_width > 1000 else "FIR"
+        self.heatmap_canvas.ax.text(0.02, 0.98, f'Filtro: {filter_type}', transform=self.heatmap_canvas.ax.transAxes, 
+                                   color='white', fontsize=10, verticalalignment='top',
+                                   bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
         self.heatmap_canvas.ax.set_xlim(0, 40000)
         self.heatmap_canvas.ax.set_xlabel("Frequência (Hz)", color="#fff")
         self.heatmap_canvas.ax.set_ylabel("Magnitude", color="#fff")
@@ -751,7 +951,6 @@ class MainWindow(QWidget):
         self.heatmap_canvas.ax.spines['left'].set_color('#fff')
         self.heatmap_canvas.ax.legend(loc='upper right', facecolor='#23272f', edgecolor='#fff', labelcolor='#fff')
         self.heatmap_canvas.draw()
-        # Removido: cálculo e atualização do spot/círculo
         # Atualiza gráfico de intensidade
         self.intensity_history.append(self.smooth_intensity)
         if len(self.intensity_history) > 100:
