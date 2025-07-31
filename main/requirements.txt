@@ -1,0 +1,27 @@
+# Core scientific computing
+numpy>=1.21.0
+scipy>=1.7.0
+
+# Audio processing
+sounddevice>=0.4.0
+
+# Computer vision and GUI
+opencv-python>=4.5.0
+matplotlib>=3.5.0
+PyQt5>=5.15.0
+
+# Optional: Acoular for advanced beamforming (install separately if needed)
+# acoular>=22.0.0
+
+# Additional dependencies that may be required
+h5py>=3.1.0
+pyyaml>=5.4.0
+
+# PyTables is optional and may not be available for all Python versions
+# If needed, install manually: pip install tables
+
+# Threading and system utilities (built-in with Python)
+# threading
+# os
+# time
+# sys 

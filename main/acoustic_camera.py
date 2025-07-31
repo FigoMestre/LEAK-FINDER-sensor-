@@ -572,6 +572,13 @@ class MainWindow(QWidget):
         self.prev_lp_value = self.lp_value
         self.last_auto_save_time = 0  # Para cooldown de save automático
         self.frames_dir = os.path.abspath('.')
+        # Variáveis para escala adaptativa da intensidade
+        self.intensity_max = 0.0
+        self.intensity_min = 0.0
+        self.intensity_scale_window = 50  # Janela de amostras para calcular a escala
+        self.intensity_scale_margin = 0.1  # Margem de 10% acima e abaixo
+        self.intensity_scale_reset_threshold = 0.5  # Reset da escala se a intensidade for muito maior
+        self.last_scale_reset_time = 0  # Para evitar resets muito frequentes
         # --- Inicializa filtros como atributos ---
         self.bandpass_sos = create_bandpass_filter(self.hp_value, self.lp_value, SAMPLE_RATE)
         self.fir_taps = create_fir_bandpass(self.hp_value, self.lp_value, SAMPLE_RATE)
@@ -951,21 +958,70 @@ class MainWindow(QWidget):
         self.heatmap_canvas.ax.spines['left'].set_color('#fff')
         self.heatmap_canvas.ax.legend(loc='upper right', facecolor='#23272f', edgecolor='#fff', labelcolor='#fff')
         self.heatmap_canvas.draw()
-        # Atualiza gráfico de intensidade
+        # Atualiza gráfico de intensidade com escala adaptativa
         self.intensity_history.append(self.smooth_intensity)
         if len(self.intensity_history) > 100:
             self.intensity_history.pop(0)
+        
+        # Calcula escala adaptativa baseada na janela de amostras
+        if len(self.intensity_history) >= self.intensity_scale_window:
+            recent_intensities = self.intensity_history[-self.intensity_scale_window:]
+            current_max = max(recent_intensities)
+            current_min = min(recent_intensities)
+            
+            # Verifica se precisa resetar a escala (intensidade muito maior que o máximo atual)
+            current_time = time.time()
+            if (self.smooth_intensity > self.intensity_max * self.intensity_scale_reset_threshold and 
+                current_time - self.last_scale_reset_time > 2.0):  # Reset a cada 2 segundos no máximo
+                self.intensity_max = self.smooth_intensity
+                self.intensity_min = self.smooth_intensity * 0.1  # 10% do valor atual
+                self.last_scale_reset_time = current_time
+            else:
+                # Atualiza máximo e mínimo com suavização
+                if current_max > self.intensity_max:
+                    self.intensity_max = current_max
+                else:
+                    self.intensity_max = 0.95 * self.intensity_max + 0.05 * current_max
+                
+                if current_min < self.intensity_min or self.intensity_min == 0:
+                    self.intensity_min = current_min
+                else:
+                    self.intensity_min = 0.95 * self.intensity_min + 0.05 * current_min
+        
+        # Calcula limites da escala com margem
+        if self.intensity_max > self.intensity_min:
+            range_intensity = self.intensity_max - self.intensity_min
+            margin = range_intensity * self.intensity_scale_margin
+            y_min = max(0, self.intensity_min - margin)
+            y_max = self.intensity_max + margin
+        else:
+            # Fallback para quando não há variação suficiente
+            y_min = 0
+            y_max = max(0.05, self.smooth_intensity * 1.5)
+        
         self.intensity_canvas.ax.clear()
         self.intensity_canvas.ax.plot(self.intensity_history, color="#00e676", linewidth=2)
+        
+        # Adiciona linha horizontal para mostrar o nível atual
+        self.intensity_canvas.ax.axhline(y=self.smooth_intensity, color='yellow', linestyle='--', alpha=0.7, linewidth=1)
+        
+        # Adiciona texto com informações da intensidade
+        intensity_text = f"Atual: {self.smooth_intensity:.4f}\nMáx: {self.intensity_max:.4f}\nMín: {self.intensity_min:.4f}"
+        self.intensity_canvas.ax.text(0.02, 0.98, intensity_text, transform=self.intensity_canvas.ax.transAxes,
+                                     color='white', fontsize=9, verticalalignment='top',
+                                     bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
+        
         self.intensity_canvas.ax.set_facecolor("none")
-        self.intensity_canvas.ax.set_title("Intensidade do Som", color="#fff", fontsize=12, pad=24, loc='center')
+        self.intensity_canvas.ax.set_title("Intensidade do Som (Escala Adaptativa)", color="#fff", fontsize=12, pad=24, loc='center')
         self.intensity_canvas.ax.tick_params(axis='x', colors='#fff')
         self.intensity_canvas.ax.tick_params(axis='y', colors='#fff')
         self.intensity_canvas.ax.spines['bottom'].set_color('#fff')
         self.intensity_canvas.ax.spines['top'].set_color('#fff')
         self.intensity_canvas.ax.spines['right'].set_color('#fff')
         self.intensity_canvas.ax.spines['left'].set_color('#fff')
-        self.intensity_canvas.ax.set_ylim(0, max(0.05, max(self.intensity_history)))
+        self.intensity_canvas.ax.set_ylim(y_min, y_max)
+        self.intensity_canvas.ax.set_xlabel("Amostras", color="#fff")
+        self.intensity_canvas.ax.set_ylabel("Intensidade", color="#fff")
         self.intensity_canvas.draw()
 
         # --- Salvamento automático de frames no Airleak Mode ---
