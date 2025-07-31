@@ -1,4 +1,4 @@
-# LEAK-FINDER Sensor - Câmera Acústica de Baixo Custo
+# LEAK-FINDER Sensor - Câmera Acústica
 
 Este projeto implementa uma câmera acústica em tempo real usando uma webcam USB e um array de microfones miniDSP UMA-16 (16 microfones) no Windows. Utiliza Python, processamento de áudio avançado e OpenCV para visualização.
 
